@@ -111,6 +111,21 @@ class TestVisionAnalyzeNative:
         url = next(p["image_url"]["url"] for p in parts if p.get("type") == "image_url")
         assert url.startswith("data:image/")
 
+    def test_svg_file_returns_text_error_not_multimodal_envelope(self, tmp_path):
+        """Unsupported formats must not enter immutable tool-result history."""
+        svg = tmp_path / "preview.svg"
+        svg.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+
+        result = asyncio.get_event_loop().run_until_complete(
+            _vision_analyze_native(str(svg), "describe")
+        )
+
+        assert isinstance(result, str)
+        parsed = json.loads(result)
+        assert parsed.get("success") is False
+        assert "unsupported image format" in parsed.get("error", "").lower()
+        assert "image/svg+xml" in parsed.get("error", "")
+
     def test_missing_file_returns_error_string(self, tmp_path):
         result = asyncio.get_event_loop().run_until_complete(
             _vision_analyze_native(str(tmp_path / "nope.png"), "?")

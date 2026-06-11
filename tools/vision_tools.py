@@ -128,6 +128,23 @@ def _detect_image_mime_type(image_path: Path) -> Optional[str]:
     return None
 
 
+_VISION_EMBED_MIME_TYPES = frozenset({
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+})
+
+
+def _unsupported_embed_format_error(mime_type: str) -> str:
+    supported = ", ".join(sorted(_VISION_EMBED_MIME_TYPES))
+    return (
+        f"Unsupported image format for native vision: {mime_type}. "
+        f"Supported formats: {supported}. Convert the file to PNG, JPEG, GIF, "
+        "or WebP, or capture a raster screenshot and retry."
+    )
+
+
 def _is_retryable_download_error(error: Exception) -> bool:
     """Return True only for transient image-download failures worth retrying.
 
@@ -741,6 +758,11 @@ async def _vision_analyze_native(
         if not detected_mime_type:
             return tool_error(
                 "Only real image files are supported for vision analysis.",
+                success=False,
+            )
+        if detected_mime_type not in _VISION_EMBED_MIME_TYPES:
+            return tool_error(
+                _unsupported_embed_format_error(detected_mime_type),
                 success=False,
             )
 

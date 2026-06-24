@@ -600,6 +600,39 @@ _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 
+def _looks_like_telegram_private_chat_id(chat_id: str) -> bool:
+    try:
+        return int(str(chat_id)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _delivery_send_metadata(
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+) -> dict | None:
+    """Build platform thread metadata for cron delivery sends.
+
+    Telegram private-DM topics are not normal forum topics: sending only
+    ``message_thread_id`` can fail or render outside the visible topic. Use
+    ``direct_messages_topic_id`` for synthetic cron alerts so replies stay in
+    the expected DM topic lane.
+    """
+    if not thread_id:
+        return None
+    metadata: dict[str, str | bool] = {"thread_id": str(thread_id)}
+    if (
+        str(platform_name).lower() == "telegram"
+        and _looks_like_telegram_private_chat_id(chat_id)
+    ):
+        metadata["telegram_dm_topic_reply_fallback"] = True
+        tid = str(thread_id)
+        if tid and tid != "1":
+            metadata["direct_messages_topic_id"] = tid
+    return metadata
+
+
 def _send_media_via_adapter(
     adapter,
     chat_id: str,
@@ -757,7 +790,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
+            send_metadata = _delivery_send_metadata(platform_name, chat_id, thread_id)
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()

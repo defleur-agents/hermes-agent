@@ -788,6 +788,62 @@ class TestDeliverResultWrapping:
         assert "MEDIA:" not in text_sent
         assert "Report" in text_sent
 
+    def test_live_adapter_telegram_dm_topic_uses_direct_topic_metadata(self):
+        """Cron delivery to Telegram DM topics should not use bare message_thread_id.
+
+        Private DM topic sends need direct_messages_topic_id metadata (and the
+        DM-topic marker) so synthetic cron alerts stay in the visible topic
+        instead of falling back to the main DM or an unrelated topic.
+        """
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        job = {
+            "id": "digest-job",
+            "deliver": "origin",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "74380703",
+                "chat_type": "dm",
+                "thread_id": "489679",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(
+                job,
+                "Morning digest is ready.",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        adapter.send.assert_called_once()
+        metadata = adapter.send.call_args.kwargs["metadata"]
+        assert metadata == {
+            "thread_id": "489679",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "489679",
+        }
+
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""
         from gateway.config import Platform
@@ -2596,7 +2652,11 @@ class TestDeliverResultTimeoutCancelsFuture:
         adapter.send.assert_called_once_with(
             "226252250",
             "Hello world",
-            metadata={"thread_id": "7072"},
+            metadata={
+                "thread_id": "7072",
+                "telegram_dm_topic_reply_fallback": True,
+                "direct_messages_topic_id": "7072",
+            },
         )
 
 

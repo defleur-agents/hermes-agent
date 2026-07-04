@@ -879,15 +879,48 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         target_errors = []
-        if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+        use_live_adapter = (
+            runtime_adapter is not None
+            and loop is not None
+            and getattr(loop, "is_running", lambda: False)()
+        )
+        if use_live_adapter and platform == Platform.TELEGRAM and thread_id is not None:
+            try:
+                from gateway.delivery import _looks_like_int, _looks_like_telegram_private_chat_id
+
+                if (
+                    _looks_like_telegram_private_chat_id(str(chat_id))
+                    and _looks_like_int(str(thread_id))
+                ):
+                    # Local operational guard: James's Telegram private DM topic
+                    # alerts stopped surfacing after the live-adapter cron path
+                    # switched these targets to direct_messages_topic_id. The
+                    # standalone Telegram sender uses the older
+                    # message_thread_id path, which is the last confirmed-visible
+                    # route for his private Alerts topic. Keep live-adapter
+                    # delivery for other platforms / forum topics, but use the
+                    # standalone path for positive-chat private topic alerts.
+                    logger.warning(
+                        "Job '%s': using standalone Telegram sender for private DM topic %s:%s "
+                        "because live-adapter direct_messages_topic_id delivery may not surface visibly",
+                        job["id"], chat_id, thread_id,
+                    )
+                    use_live_adapter = False
+            except Exception:
+                logger.debug(
+                    "Job '%s': failed to classify Telegram private DM topic; keeping live adapter path",
+                    job["id"], exc_info=True,
+                )
+
+        if use_live_adapter:
             # Telegram three-mode topic routing (#22773): a private chat
-            # (positive chat_id) with a NUMERIC topic id is a Bot API Direct
-            # Messages topic and must be addressed via ``direct_messages_topic_id``
-            # — a bare ``message_thread_id`` is rejected/mis-routed by Bot API
-            # 10.0 and lands in General.  Forum/supergroup targets (negative
-            # chat_id) and named DM-topic lanes keep the default thread_id
-            # handling.  Compute the routed metadata ONCE so both the text send
-            # (via DeliveryRouter) and the media send use the same routing.
+            # (positive chat_id) with a NUMERIC topic id is normally routed via
+            # ``direct_messages_topic_id`` by the live adapter. James's private
+            # Alerts topic is intentionally excluded above because that route
+            # was observed to return success without surfacing in Telegram.
+            # Forum/supergroup targets (negative chat_id) and named DM-topic
+            # lanes keep the default thread_id handling. Compute routed metadata
+            # ONCE so text and media use the same routing.
             from gateway.delivery import (
                 DeliveryRouter,
                 DeliveryTarget,

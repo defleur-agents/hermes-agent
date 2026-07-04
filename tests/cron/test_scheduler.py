@@ -3023,27 +3023,24 @@ class TestDeliverResultTimeoutCancelsFuture:
         standalone_send.assert_awaited_once()
         assert result is None, f"standalone should have delivered, got: {result!r}"
 
-    def test_live_adapter_private_dm_topic_routes_via_direct_messages_topic_id(self):
-        """#22773: a cron target to a PRIVATE Telegram chat with a numeric topic
-        id must be routed via ``direct_messages_topic_id`` (Bot API DM topics),
-        NOT a bare ``message_thread_id`` (which Bot API 10.0 rejects / mis-routes
-        to General).  The cron live-adapter path routes through the gateway
-        DeliveryRouter, which applies the same three-mode routing as live
-        messages.
+    def test_telegram_private_dm_topic_uses_standalone_sender_for_visibility(self):
+        """James's Telegram private DM-topic cron alerts must use the standalone
+        Telegram sender.
+
+        The live-adapter ``direct_messages_topic_id`` route returned Bot API
+        success while alerts did not surface in Telegram's visible private
+        Alerts topic. The standalone path uses the older ``message_thread_id``
+        route, which is the last confirmed-visible path for these cron alerts.
         """
         from gateway.config import Platform
-        from gateway.platforms.base import SendResult
-        from concurrent.futures import Future
 
-        send_result = SendResult(success=True, message_id="42")
         adapter = MagicMock()
-        adapter.send = AsyncMock(return_value=send_result)
+        adapter.send = AsyncMock()
 
         pconfig = MagicMock()
         pconfig.enabled = True
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-        # DeliveryRouter consults the silence-narration config flag.
         mock_cfg.filter_silence_narration = False
 
         loop = MagicMock()
@@ -3053,19 +3050,11 @@ class TestDeliverResultTimeoutCancelsFuture:
             "id": "dm-topic-job",
             "deliver": "telegram:226252250:7072",  # private chat + numeric topic
         }
-
-        def fake_run_coro(coro, _loop):
-            import asyncio as _asyncio
-            future = Future()
-            try:
-                future.set_result(_asyncio.run(coro))
-            except BaseException as _e:  # noqa: BLE001
-                future.set_exception(_e)
-            return future
+        standalone_send = AsyncMock(return_value={"success": True, "message_id": "99"})
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(
                 job,
                 "Hello world",
@@ -3074,24 +3063,22 @@ class TestDeliverResultTimeoutCancelsFuture:
             )
 
         assert result is None, f"expected clean delivery, got: {result!r}"
-        adapter.send.assert_called_once()
-        sent_chat_id, sent_text = adapter.send.call_args[0][0], adapter.send.call_args[0][1]
-        sent_metadata = adapter.send.call_args[1]["metadata"]
-        assert sent_chat_id == "226252250"
-        assert sent_text == "Hello world"
-        # The topic must be addressed via direct_messages_topic_id, and a bare
-        # message_thread_id must NOT be set (that is the Bot API 10.0 bug).
-        assert str(sent_metadata.get("direct_messages_topic_id")) == "7072"
-        assert not sent_metadata.get("message_thread_id")
+        adapter.send.assert_not_called()
+        standalone_send.assert_awaited_once()
+        call = standalone_send.await_args
+        assert call is not None
+        args = call.args
+        kwargs = call.kwargs
+        assert args[0] == Platform.TELEGRAM
+        assert args[2] == "226252250"
+        assert args[3] == "Hello world"
+        assert kwargs["thread_id"] == "7072"
 
-    def test_live_adapter_private_dm_topic_media_routes_via_direct_messages_topic_id(self, tmp_path, monkeypatch):
-        """#22773 (media): MEDIA attachments to a private DM topic must also be
-        routed via ``direct_messages_topic_id``, not a bare ``message_thread_id``
-        — the media path previously used the bare thread_id and landed
-        attachments in the General lane."""
+    def test_telegram_private_dm_topic_media_uses_standalone_sender_for_visibility(self, tmp_path, monkeypatch):
+        """MEDIA attachments for James's Telegram private DM-topic cron alerts
+        follow the same standalone path so text and media land together.
+        """
         from gateway.config import Platform
-        from gateway.platforms.base import SendResult
-        from concurrent.futures import Future
 
         media_root = tmp_path / "media-cache"
         media_file = media_root / "chart.png"
@@ -3104,8 +3091,6 @@ class TestDeliverResultTimeoutCancelsFuture:
         media_path = media_file.resolve()
 
         adapter = AsyncMock()
-        adapter.send.return_value = SendResult(success=True, message_id="1")
-        adapter.send_image_file.return_value = SendResult(success=True, message_id="2")
 
         pconfig = MagicMock()
         pconfig.enabled = True
@@ -3120,31 +3105,27 @@ class TestDeliverResultTimeoutCancelsFuture:
             "id": "dm-topic-media-job",
             "deliver": "telegram:226252250:7072",  # private chat + numeric topic
         }
-
-        def fake_run_coro(coro, _loop):
-            import asyncio as _asyncio
-            future = Future()
-            try:
-                future.set_result(_asyncio.run(coro))
-            except BaseException as _e:  # noqa: BLE001
-                future.set_exception(_e)
-            return future
+        standalone_send = AsyncMock(return_value={"success": True, "message_id": "99"})
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            _deliver_result(
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
                 job,
                 f"Chart attached\nMEDIA:{media_path}",
                 adapters={Platform.TELEGRAM: adapter},
                 loop=loop,
             )
 
-        adapter.send_image_file.assert_called_once()
-        media_metadata = adapter.send_image_file.call_args[1]["metadata"]
-        assert str(media_metadata.get("direct_messages_topic_id")) == "7072"
-        assert not media_metadata.get("message_thread_id")
-        assert not media_metadata.get("thread_id")
+        assert result is None, f"expected clean delivery, got: {result!r}"
+        adapter.send.assert_not_called()
+        adapter.send_image_file.assert_not_called()
+        standalone_send.assert_awaited_once()
+        call = standalone_send.await_args
+        assert call is not None
+        kwargs = call.kwargs
+        assert kwargs["thread_id"] == "7072"
+        assert kwargs["media_files"] == [(str(media_path), False)]
 
     def test_live_adapter_forum_thread_fallback_records_delivery_error(self):
         """A forum/supergroup cron target whose configured topic is gone must

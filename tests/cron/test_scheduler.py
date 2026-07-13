@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _run_cron_recovery_turn
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1510,8 +1510,9 @@ class TestRunJobSessionPersistence:
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
+            mock_agent.max_iterations = 60
             first_messages = [{"role": "assistant", "content": "checkpoint"}]
-            mock_agent.run_conversation.side_effect = [
+            responses = iter([
                 {
                     "final_response": "partial progress checkpoint",
                     "messages": first_messages,
@@ -1525,7 +1526,14 @@ class TestRunJobSessionPersistence:
                     "failed": False,
                     "turn_exit_reason": "completed_no_tools",
                 },
-            ]
+            ])
+            observed_budgets = []
+
+            def run_conversation(*_args, **_kwargs):
+                observed_budgets.append(mock_agent.max_iterations)
+                return next(responses)
+
+            mock_agent.run_conversation.side_effect = run_conversation
             mock_agent_cls.return_value = mock_agent
 
             success, output, final_response, error = run_job(job)
@@ -1538,7 +1546,10 @@ class TestRunJobSessionPersistence:
         assert mock_agent.run_conversation.call_count == 2
         recovery_call = mock_agent.run_conversation.call_args_list[1]
         assert "automatic bounded recovery turn" in recovery_call.args[0]
+        assert "at most 30 recovery iterations" in recovery_call.args[0]
         assert recovery_call.kwargs["conversation_history"] == first_messages
+        assert observed_budgets == [60, 30]
+        assert mock_agent.max_iterations == 60
 
     def test_run_job_fails_after_second_max_iteration_summary(self, tmp_path):
         """A second ceiling stop is terminal and visible, never false success."""
@@ -1572,7 +1583,10 @@ class TestRunJobSessionPersistence:
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
-            mock_agent.run_conversation.side_effect = [dict(ceiling_result), dict(ceiling_result)]
+            mock_agent.max_iterations = 60
+            first_ceiling = dict(ceiling_result, final_response="first partial checkpoint")
+            second_ceiling = dict(ceiling_result, final_response="second partial checkpoint")
+            mock_agent.run_conversation.side_effect = [first_ceiling, second_ceiling]
             mock_agent_cls.return_value = mock_agent
 
             success, output, final_response, error = run_job(job)
@@ -1580,8 +1594,39 @@ class TestRunJobSessionPersistence:
         assert success is False
         assert final_response == ""
         assert "automatic max-iteration recovery exhausted" in str(error)
+        assert "first partial checkpoint" in str(error)
+        assert "second partial checkpoint" in str(error)
         assert "(FAILED)" in output
         assert mock_agent.run_conversation.call_count == 2
+        assert mock_agent.max_iterations == 60
+
+    def test_recovery_timeout_reports_that_turn_may_still_be_live(self, monkeypatch):
+        import time
+
+        class SlowAgent:
+            def run_conversation(self, *_args, **_kwargs):
+                time.sleep(0.15)
+                return {"completed": False, "final_response": "late"}
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 999}
+
+            def interrupt(self, _reason):
+                return None
+
+        monkeypatch.setenv("HERMES_CRON_INTERRUPT_GRACE_SECONDS", "0.01")
+        with patch(
+            "cron.scheduler.concurrent.futures.wait",
+            return_value=(set(), set()),
+        ):
+            with pytest.raises(TimeoutError, match="turn may still be live"):
+                _run_cron_recovery_turn(
+                    SlowAgent(),
+                    "continue",
+                    [],
+                    inactivity_limit=1,
+                    job_name="slow recovery",
+                )
 
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,

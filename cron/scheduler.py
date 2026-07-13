@@ -2530,10 +2530,18 @@ def _run_cron_recovery_turn(
                 if idle_seconds >= inactivity_limit:
                     if hasattr(agent, "interrupt"):
                         agent.interrupt("Cron recovery timed out (inactivity)")
-                    raise TimeoutError(
-                        f"Cron recovery for '{job_name}' idle for "
-                        f"{int(idle_seconds)}s (limit {int(inactivity_limit)}s)"
+                    grace_seconds = float(
+                        os.getenv("HERMES_CRON_INTERRUPT_GRACE_SECONDS", "10")
                     )
+                    try:
+                        result = future.result(timeout=max(0.1, grace_seconds))
+                    except concurrent.futures.TimeoutError as exc:
+                        raise TimeoutError(
+                            f"Cron recovery for '{job_name}' idle for "
+                            f"{int(idle_seconds)}s (limit {int(inactivity_limit)}s); "
+                            "interrupt grace expired and the turn may still be live"
+                        ) from exc
+                    break
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
@@ -3238,28 +3246,45 @@ def run_job(
         # messages, then fail visibly if the bounded recovery also hits its cap.
         if _is_max_iteration_summary(result):
             first_summary = str(result.get("final_response") or "").strip()
-            recovery_prompt = f"""[System note: The previous cron turn hit the Hermes tool-call ceiling. This is one automatic bounded recovery turn, not a new scheduled run. Resume the original objective from the existing transcript and durable artifacts. Inspect what is already complete; finish only the unmet acceptance gates; verify the real result; and return the job's intended final output. Do not repeat non-idempotent external actions or restart from scratch. Process exit alone is not verification.]
+            try:
+                recovery_max_iterations = max(
+                    1,
+                    min(
+                        int(max_iterations),
+                        int(agent_cfg.get("max_iteration_recovery_max_turns", 30)),
+                    ),
+                )
+            except (TypeError, ValueError):
+                recovery_max_iterations = 30
+            recovery_prompt = f"""[System note: The previous cron turn hit the Hermes tool-call ceiling. This is one automatic bounded recovery turn, not a new scheduled run. Resume the original objective from the existing transcript and durable artifacts. Inspect what is already complete; finish only the unmet acceptance gates; verify the real result; and return the job's intended final output. Do not repeat non-idempotent external actions or restart from scratch. Process exit alone is not verification. You have at most {recovery_max_iterations} recovery iterations: converge rather than explore.]
 
 First-turn progress summary:
 {first_summary[-6000:]}
 """
             logger.warning(
-                "Job '%s' reached the iteration limit — starting one bounded continuation turn",
+                "Job '%s' reached the iteration limit — starting one bounded continuation turn with %d iterations",
                 job_name,
+                recovery_max_iterations,
             )
             history = result.get("messages")
-            result = _run_cron_recovery_turn(
-                agent,
-                recovery_prompt,
-                history if isinstance(history, list) else None,
-                inactivity_limit=_cron_inactivity_limit,
-                job_name=job_name,
-            )
+            previous_max_iterations = agent.max_iterations
+            agent.max_iterations = recovery_max_iterations
+            try:
+                result = _run_cron_recovery_turn(
+                    agent,
+                    recovery_prompt,
+                    history if isinstance(history, list) else None,
+                    inactivity_limit=_cron_inactivity_limit,
+                    job_name=job_name,
+                )
+            finally:
+                agent.max_iterations = previous_max_iterations
             if _is_max_iteration_summary(result):
                 exhausted_summary = str(result.get("final_response") or "").strip()
                 raise RuntimeError(
                     "automatic max-iteration recovery exhausted its second turn"
-                    + (f": {exhausted_summary[:800]}" if exhausted_summary else "")
+                    f"\n\nFirst-attempt checkpoint:\n{first_summary[:3000]}"
+                    f"\n\nRecovery checkpoint:\n{exhausted_summary[:3000]}"
                 )
 
         # If the agent itself reported failure (e.g. all retries exhausted on

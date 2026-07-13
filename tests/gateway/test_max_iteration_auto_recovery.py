@@ -8,7 +8,7 @@ from gateway.run import (
 
 def _ceiling_result(**overrides):
     result = {
-        "turn_exit_reason": "max_iterations",
+        "turn_exit_reason": "max_iterations_reached(90/90)",
         "completed": False,
         "partial": True,
         "final_response": "Reached maximum iterations (90).",

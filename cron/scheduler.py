@@ -2656,6 +2656,71 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _is_max_iteration_summary(result: Any) -> bool:
+    """Return True when Hermes stopped at the tool-call ceiling with a summary."""
+    if not isinstance(result, dict):
+        return False
+    reason = str(result.get("turn_exit_reason") or "")
+    return (
+        result.get("failed") is not True
+        and result.get("completed") is False
+        and reason.startswith("max_iterations_reached(")
+        and bool(str(result.get("final_response") or "").strip())
+    )
+
+
+def _run_cron_recovery_turn(
+    agent: Any,
+    prompt: str,
+    history: Optional[list[dict]],
+    *,
+    inactivity_limit: Optional[float],
+    job_name: str,
+) -> dict:
+    """Run one continuation turn with the same inactivity protection as cron."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    context = contextvars.copy_context()
+
+    def invoke() -> dict:
+        return agent.run_conversation(prompt, conversation_history=history)
+
+    future = pool.submit(context.run, invoke)
+    try:
+        if inactivity_limit is None:
+            result = future.result()
+        else:
+            result = None
+            while True:
+                done, _ = concurrent.futures.wait({future}, timeout=5.0)
+                if done:
+                    result = future.result()
+                    break
+                idle_seconds = 0.0
+                if hasattr(agent, "get_activity_summary"):
+                    try:
+                        idle_seconds = float(
+                            agent.get_activity_summary().get("seconds_since_activity", 0.0)
+                        )
+                    except Exception:
+                        pass
+                if idle_seconds >= inactivity_limit:
+                    if hasattr(agent, "interrupt"):
+                        agent.interrupt("Cron recovery timed out (inactivity)")
+                    raise TimeoutError(
+                        f"Cron recovery for '{job_name}' idle for "
+                        f"{int(idle_seconds)}s (limit {int(inactivity_limit)}s)"
+                    )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "cron recovery run_conversation returned "
+            f"{type(result).__name__} instead of dict: {result!r}"
+        )
+    return result
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3504,34 +3569,47 @@ def run_job(
                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
             )
 
+        # A max-iteration summary is a progress checkpoint, not completion.
+        # Continue once in the same cron session with the first turn's full
+        # messages, then fail visibly if the bounded recovery also hits its cap.
+        if _is_max_iteration_summary(result):
+            first_summary = str(result.get("final_response") or "").strip()
+            recovery_prompt = f"""[System note: The previous cron turn hit the Hermes tool-call ceiling. This is one automatic bounded recovery turn, not a new scheduled run. Resume the original objective from the existing transcript and durable artifacts. Inspect what is already complete; finish only the unmet acceptance gates; verify the real result; and return the job's intended final output. Do not repeat non-idempotent external actions or restart from scratch. Process exit alone is not verification.]
+
+First-turn progress summary:
+{first_summary[-6000:]}
+"""
+            logger.warning(
+                "Job '%s' reached the iteration limit — starting one bounded continuation turn",
+                job_name,
+            )
+            history = result.get("messages")
+            result = _run_cron_recovery_turn(
+                agent,
+                recovery_prompt,
+                history if isinstance(history, list) else None,
+                inactivity_limit=_cron_inactivity_limit,
+                job_name=job_name,
+            )
+            if _is_max_iteration_summary(result):
+                exhausted_summary = str(result.get("final_response") or "").strip()
+                raise RuntimeError(
+                    "automatic max-iteration recovery exhausted its second turn"
+                    + (f": {exhausted_summary[:800]}" if exhausted_summary else "")
+                )
+
         # If the agent itself reported failure (e.g. all retries exhausted on
         # API errors, model abort, mid-run interrupt), do not silently mark the
-        # job as successful. run_agent populates `failed=True`/`completed=False`
-        # on these paths and may put the error into `final_response`, which
-        # would otherwise be delivered as if it were the agent's reply and the
-        # job's `last_status` set to "ok". Raise so the except handler below
-        # builds the proper failure tuple. (issue #17855)
+        # job as successful. A zero exit or fallback summary is not enough.
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
-        max_iteration_summary = (
-            result.get("failed") is not True
-            and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
-            and bool(final_response_text)
-        )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if result.get("failed") is True or result.get("completed") is False:
             _err_text = (
                 result.get("error")
                 or final_response_text
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
-        if max_iteration_summary:
-            logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
-            )
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.

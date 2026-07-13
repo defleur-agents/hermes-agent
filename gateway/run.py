@@ -2873,7 +2873,7 @@ def _max_iteration_recovery_prompt(
         str(agent_result.get(field) or "")
         for field in ("error", "final_response")
     ).lower()
-    hit_ceiling = reason == "max_iterations" or any(
+    hit_ceiling = reason == "max_iterations" or reason.startswith("max_iterations_reached(") or any(
         marker in diagnostic
         for marker in (
             "reached maximum iterations",

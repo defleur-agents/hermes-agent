@@ -2665,6 +2665,58 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _max_iteration_recovery_prompt(
+    agent_result: dict,
+    *,
+    pending_event: object = None,
+    pending: object = None,
+    recovery_depth: int = 0,
+    max_attempts: int = 1,
+) -> str | None:
+    """Build one bounded continuation turn for a tool-call ceiling stop.
+
+    A queued human message always wins.  ``recovery_depth`` is shared with the
+    existing in-band follow-up recursion, which naturally prevents an infinite
+    recovery loop.  The prefix deliberately matches ``_AUTO_CONTINUE_NOTE_PREFIX``
+    so this synthetic instruction is stripped from future transcript replay.
+    """
+    if not isinstance(agent_result, dict) or pending_event is not None or pending:
+        return None
+    try:
+        attempts = max(0, min(3, int(max_attempts)))
+    except (TypeError, ValueError):
+        attempts = 1
+    if attempts == 0 or recovery_depth >= attempts:
+        return None
+
+    reason = str(agent_result.get("turn_exit_reason") or "").strip().lower()
+    diagnostic = "\n".join(
+        str(agent_result.get(field) or "")
+        for field in ("error", "final_response")
+    ).lower()
+    hit_ceiling = reason == "max_iterations" or any(
+        marker in diagnostic
+        for marker in (
+            "reached maximum iterations",
+            "maximum number of tool-calling iterations allowed",
+            "tool-call ceiling",
+        )
+    )
+    if not hit_ceiling:
+        return None
+
+    return (
+        "[System note: Your previous turn hit the Hermes tool-call ceiling. "
+        "This is an automatic bounded recovery turn, not a new user request. "
+        "Continue the original task from durable progress rather than restarting: "
+        "inspect the transcript, todo state, files, and real system state; identify "
+        "only the unmet acceptance gates; finish them; and verify the result before "
+        "replying. Do not repeat non-idempotent external actions or claim success "
+        "from process exit alone. If the task is already complete, verify that and "
+        "return the final result. This is the final automatic recovery attempt.]"
+    )
+
+
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     """Return True only when a gateway turn really completed successfully.
 
@@ -19537,6 +19589,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pending = _leftover_steer
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
+            # A max-iteration stop is recoverable, not a semantic completion.
+            # Reuse the existing in-band queued-turn machinery for one bounded
+            # continuation. Human queued messages and /steer always win, and the
+            # recursion depth prevents this from becoming an infinite loop.
+            _auto_iteration_recovery = False
+            if result and not pending and not pending_event and not self._draining:
+                _agent_recovery_cfg = user_config.get("agent") or {}
+                _recovery_attempts = (
+                    _agent_recovery_cfg.get("max_iteration_recovery_attempts", 1)
+                    if isinstance(_agent_recovery_cfg, dict)
+                    else 1
+                )
+                _recovery_prompt = _max_iteration_recovery_prompt(
+                    result,
+                    pending_event=pending_event,
+                    pending=pending,
+                    recovery_depth=_interrupt_depth,
+                    max_attempts=_recovery_attempts,
+                )
+                if _recovery_prompt:
+                    pending = _recovery_prompt
+                    _auto_iteration_recovery = True
+                    logger.warning(
+                        "Tool-call ceiling reached for session %s — starting bounded automatic recovery %d/%s",
+                        session_key or "?",
+                        _interrupt_depth + 1,
+                        _recovery_attempts,
+                    )
+
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
             # as user input.  The primary fix is in base.py (commands bypass the
@@ -19592,7 +19673,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
-                was_interrupted = result.get("interrupted")
+                was_interrupted = bool(isinstance(result, dict) and result.get("interrupted")) or _auto_iteration_recovery
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.

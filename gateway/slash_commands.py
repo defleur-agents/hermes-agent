@@ -1396,7 +1396,13 @@ class GatewaySlashCommandsMixin:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
-    async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_model_command(
+        self,
+        event: MessageEvent,
+        *,
+        suppress_response: bool = False,
+        skip_cost_confirmation: bool = False,
+    ) -> Optional[str]:
         """Handle /model command — switch model.
 
         Supports:
@@ -1406,6 +1412,9 @@ class GatewaySlashCommandsMixin:
           /model <name> --global              — switch and persist (explicit)
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+
+        Internal same-turn routers may suppress the switch acknowledgement so
+        the original user prompt can continue directly to the selected model.
         """
         from gateway.run import _hermes_home, _load_gateway_config
         import yaml
@@ -1975,7 +1984,7 @@ class GatewaySlashCommandsMixin:
             else:
                 lines.append(t("gateway.model.session_only_hint"))
 
-            return "\n".join(lines)
+            return None if suppress_response else "\n".join(lines)
 
         # Expensive-model confirmation gate (typed /model <name> path).
         # The pickers (Telegram/Discord inline keyboards, TUI, dashboard)
@@ -1997,7 +2006,7 @@ class GatewaySlashCommandsMixin:
             )
         except Exception:
             _cost_warning = None
-        if _cost_warning is not None:
+        if _cost_warning is not None and not skip_cost_confirmation:
             async def _on_cost_confirm(choice: str) -> str:
                 if choice == "cancel":
                     return (

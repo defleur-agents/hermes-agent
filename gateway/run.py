@@ -71,6 +71,34 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+# Model routing must happen before the LLM sees the turn: an instruction such
+# as "use Sol for this" cannot be honored by the currently selected model after
+# it has already begun answering. Keep the grammar narrow enough that ordinary
+# mentions of a person/place named Sol do not switch the session model.
+_SOL_MODEL_REQUEST_RE = re.compile(
+    r"\b(?:use|switch(?:\s+to)?|route(?:\s+to)?|run)\s+"
+    r"(?:your\s+|the\s+)?(?:beefiest\s+model|sol)\b",
+    re.IGNORECASE,
+)
+_SOL_MODEL_LEADING_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:sol|beefiest\s+model)\b"
+    r"(?=\s*(?::|,|—|-)|\s+(?:please|for|on|this|can|could|would|will)\b|$)",
+    re.IGNORECASE,
+)
+
+
+def _sol_model_requested(text: str | None) -> bool:
+    """Return whether a message explicitly requests the Sol model route."""
+    text = (text or "").strip()
+    return bool(
+        text
+        and (
+            _SOL_MODEL_REQUEST_RE.search(text)
+            or _SOL_MODEL_LEADING_DIRECTIVE_RE.search(text)
+        )
+    )
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -9752,6 +9780,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    async def _maybe_route_sol_request(self, event: MessageEvent) -> Optional[str]:
+        """Switch an explicit Sol-requesting turn before constructing its agent.
+
+        The route is session-scoped. The original prompt then falls through to
+        normal processing and is handled by the newly selected model in the
+        same inbound turn.
+        """
+        if event.message_type != MessageType.TEXT or not _sol_model_requested(event.text):
+            return None
+
+        original_text = event.text
+        event.text = "/model gpt-5.6-sol --provider openai-codex --session"
+        try:
+            switch_error = await self._handle_model_command(
+                event,
+                suppress_response=True,
+                skip_cost_confirmation=True,
+            )
+        finally:
+            event.text = original_text
+
+        if switch_error is not None:
+            logger.warning("Sol inline model route failed: %s", switch_error)
+            return switch_error
+
+        logger.info("Applied session-only Sol model route before agent creation")
+        return None
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -10519,6 +10575,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The actual interrupt message is delivered via adapter._pending_messages
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
+
+        # Resolve an explicit Sol request before agent construction. This runs
+        # only after the busy-session branch above has released the turn, so a
+        # model switch can never split an in-flight agent run across models.
+        sol_route_result = await self._maybe_route_sol_request(event)
+        if sol_route_result is not None:
+            return sol_route_result
 
         # Check for commands
         command = event.get_command()
@@ -21486,6 +21549,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_channel_prompt = None
                 next_session_key = session_key
                 if pending_event is not None:
+                    # Busy-session follow-ups bypass _handle_message() and
+                    # recurse straight into _run_agent(). Apply Sol routing at
+                    # this second entry point too, so an explicit request made
+                    # while another turn was running is never answered by the
+                    # old model after it drains.
+                    sol_route_error = await self._maybe_route_sol_request(pending_event)
+                    if sol_route_error is not None:
+                        route_failure = dict(result) if isinstance(result, dict) else {}
+                        route_failure.update(
+                            {
+                                "completed": False,
+                                "failed": True,
+                                "error": sol_route_error,
+                                "final_response": sol_route_error,
+                            }
+                        )
+                        return route_failure
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(

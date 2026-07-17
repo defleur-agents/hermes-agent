@@ -5567,6 +5567,7 @@ class TurnRunner:
                         ctx.source,
                         effective_session_id,
                         title,
+                        user_message=ctx.message,
                     )
                 elif self._runner._is_discord_auto_thread_lane(ctx.source) or (
                     self._runner._is_relay_discord_channel_lane(ctx.source)
@@ -19768,11 +19769,112 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         future.add_done_callback(_log_rename_failure)
 
+    async def _select_telegram_topic_icon_id(
+        self,
+        adapter,
+        source: SessionSource,
+        title: str,
+        user_message: str,
+    ) -> Optional[str]:
+        """Resolve an allowed full-size topic icon when the operator opts in."""
+        platform_cfg = (
+            self.config.platforms.get(source.platform)
+            if getattr(self, "config", None) and getattr(self.config, "platforms", None)
+            else None
+        )
+        extra = getattr(platform_cfg, "extra", None) or {}
+        if not is_truthy_value(extra.get("auto_topic_icons"), default=False):
+            return None
+
+        preserve_manual = is_truthy_value(
+            extra.get("preserve_manual_topic_icons"),
+            default=True,
+        )
+        if preserve_manual:
+            state_fn = getattr(adapter, "dm_topic_custom_icon_state", None)
+            if not callable(state_fn):
+                return None
+            try:
+                state = state_fn(str(source.chat_id), str(source.thread_id))
+            except Exception:
+                logger.debug("Failed to inspect Telegram topic icon state", exc_info=True)
+                return None
+            # True = user chose a custom icon; None = gateway did not observe
+            # topic creation. Preserve both rather than overwriting blindly.
+            if state is not False:
+                return None
+
+        options_fn = getattr(adapter, "get_forum_topic_icon_options", None)
+        if not callable(options_fn):
+            return None
+        try:
+            options_result = options_fn()
+            raw_options = (
+                await options_result
+                if inspect.isawaitable(options_result)
+                else options_result
+            )
+        except Exception:
+            logger.debug("Failed to fetch Telegram topic icon options", exc_info=True)
+            return None
+
+        option_items = raw_options if isinstance(raw_options, (list, tuple)) else []
+        options = [
+            option
+            for option in option_items
+            if isinstance(option, dict)
+            and str(option.get("emoji") or "").strip()
+            and str(option.get("custom_emoji_id") or "").strip()
+        ]
+        if not options:
+            return None
+        icon_ids = {
+            str(option["emoji"]).strip(): str(option["custom_emoji_id"]).strip()
+            for option in options
+        }
+
+        selected_emoji = None
+        overrides = extra.get("topic_icon_overrides")
+        normalized_title = re.sub(r"\s+", " ", str(title or "")).strip().casefold()
+        if isinstance(overrides, dict):
+            for override_title, override_emoji in overrides.items():
+                normalized_override = re.sub(
+                    r"\s+", " ", str(override_title or "")
+                ).strip().casefold()
+                if normalized_override == normalized_title:
+                    selected_emoji = str(override_emoji or "").strip()
+                    break
+
+        if selected_emoji not in icon_ids:
+            from agent.title_generator import choose_topic_icon
+
+            selected_emoji = await asyncio.to_thread(
+                choose_topic_icon,
+                title,
+                user_message,
+                list(icon_ids),
+            )
+        selected_id = icon_ids.get(selected_emoji or "")
+        if selected_id and preserve_manual:
+            # The auxiliary choice can take a few seconds. Recheck after it
+            # returns so an icon the user selected meanwhile still wins.
+            latest_state_fn = getattr(adapter, "dm_topic_custom_icon_state", None)
+            if not callable(latest_state_fn):
+                return None
+            try:
+                if latest_state_fn(str(source.chat_id), str(source.thread_id)) is not False:
+                    return None
+            except Exception:
+                logger.debug("Failed to recheck Telegram topic icon state", exc_info=True)
+                return None
+        return selected_id
+
     async def _rename_telegram_topic_for_session_title(
         self,
         source: SessionSource,
         session_id: str,
         title: str,
+        user_message: str = "",
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
@@ -19822,14 +19924,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter is None:
             return
         topic_name = self._sanitize_telegram_topic_title(title)
+        icon_custom_emoji_id = await self._select_telegram_topic_icon_id(
+            adapter,
+            source,
+            topic_name,
+            user_message,
+        )
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
-                await rename_topic(
-                    chat_id=str(source.chat_id),
-                    thread_id=str(source.thread_id),
-                    name=topic_name,
-                )
+                rename_kwargs = {
+                    "chat_id": str(source.chat_id),
+                    "thread_id": str(source.thread_id),
+                    "name": topic_name,
+                }
+                if icon_custom_emoji_id:
+                    rename_kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+                await rename_topic(**rename_kwargs)
                 return
 
             bot = getattr(adapter, "_bot", None)
@@ -19839,17 +19950,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if edit_forum_topic is None:
                 return
             try:
-                await edit_forum_topic(
-                    chat_id=int(source.chat_id),
-                    message_thread_id=int(source.thread_id),
-                    name=topic_name,
-                )
+                edit_kwargs = {
+                    "chat_id": int(source.chat_id),
+                    "message_thread_id": int(source.thread_id),
+                    "name": topic_name,
+                }
+                if icon_custom_emoji_id:
+                    edit_kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+                await edit_forum_topic(**edit_kwargs)
             except (TypeError, ValueError):
-                await edit_forum_topic(
-                    chat_id=source.chat_id,
-                    message_thread_id=source.thread_id,
-                    name=topic_name,
-                )
+                edit_kwargs = {
+                    "chat_id": source.chat_id,
+                    "message_thread_id": source.thread_id,
+                    "name": topic_name,
+                }
+                if icon_custom_emoji_id:
+                    edit_kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+                await edit_forum_topic(**edit_kwargs)
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 
@@ -19881,6 +19998,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
+        user_message: str = "",
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
         if not title or not self._is_telegram_topic_lane(source):
@@ -19898,7 +20016,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
-            self._rename_telegram_topic_for_session_title(copied_source, session_id, title),
+            self._rename_telegram_topic_for_session_title(
+                copied_source,
+                session_id,
+                title,
+                user_message=user_message,
+            ),
             loop,
             logger=logger,
             log_message="Telegram topic title rename failed to schedule",

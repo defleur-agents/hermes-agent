@@ -256,18 +256,18 @@ class TestJobCRUD:
             prompt="Recover the failed build",
             schedule="30m",
             name="Recovery attempt",
-            dedup_key="idea-recovery:chain-123:1",
+            dedup_key="recovery:chain-123:1",
         )
         second = create_job(
             prompt="This second payload must not create a duplicate",
             schedule=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
             name="Duplicate recovery attempt",
-            dedup_key="idea-recovery:chain-123:1",
+            dedup_key="recovery:chain-123:1",
         )
 
         assert second["id"] == first["id"]
         assert second["prompt"] == first["prompt"]
-        assert first["dedup_key"] == "idea-recovery:chain-123:1"
+        assert first["dedup_key"] == "recovery:chain-123:1"
         assert len(load_jobs()) == 1
 
     def test_list_jobs(self, tmp_cron_dir):

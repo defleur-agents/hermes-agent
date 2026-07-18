@@ -10308,7 +10308,62 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
-        # running gateway needs restarting to pick up the new code.
+        # running gateway needs restarting to pick up the new code. On this
+        # install, never disrupt active gateway work automatically: a live
+        # Telegram update in July 2026 killed multiple in-flight tasks. If the
+        # gateway reports active agents, terminal background processes, or
+        # running cron jobs, leave the gateway on the old code and print an
+        # explicit follow-up instead.
+        try:
+            import json as _json
+
+            _home = get_hermes_home()
+            _active_reasons = []
+            try:
+                _gw_state = _json.loads((_home / "gateway_state.json").read_text())
+                _active_agents = int(_gw_state.get("active_agents") or 0)
+                if _active_agents > 0:
+                    _active_reasons.append(f"active_agents={_active_agents}")
+            except Exception:
+                pass
+            try:
+                _procs = _json.loads((_home / "processes.json").read_text())
+                if isinstance(_procs, list) and _procs:
+                    _active_reasons.append(f"background_processes={len(_procs)}")
+            except Exception:
+                pass
+            try:
+                _jobs = _json.loads((_home / "cron" / "jobs.json").read_text())
+                if isinstance(_jobs, dict):
+                    _iter_jobs = _jobs.values()
+                elif isinstance(_jobs, list):
+                    _iter_jobs = _jobs
+                else:
+                    _iter_jobs = []
+                _running_cron = [
+                    j
+                    for j in _iter_jobs
+                    if isinstance(j, dict)
+                    and str(j.get("state") or j.get("status") or "").lower()
+                    in {"running", "in_progress"}
+                ]
+                if _running_cron:
+                    _active_reasons.append(f"running_cron={len(_running_cron)}")
+            except Exception:
+                pass
+            if _active_reasons:
+                print()
+                print("⚠ Skipping automatic Hermes gateway restart after update: active work detected.")
+                print("  " + ", ".join(_active_reasons))
+                print("  Restart later only after the gateway is idle:")
+                print("    hermes gateway restart")
+                print()
+                print("Tip: You can now select a provider and model:")
+                print("  hermes model              # Select provider and model")
+                return
+        except Exception as _active_guard_exc:
+            logger.debug("Active-work guard before gateway restart failed: %s", _active_guard_exc)
+
         try:
             from hermes_cli.gateway import (
                 is_macos,

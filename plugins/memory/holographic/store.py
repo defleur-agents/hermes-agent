@@ -81,6 +81,21 @@ _UNHELPFUL_DELTA = -0.10
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
+# FactStore is deep recall, not a transcript or compaction archive. Keep a
+# bounded, single-line unit rather than silently truncating user text: callers
+# must distill a durable statement or split genuinely separate facts.
+_MAX_FACT_CONTENT_CHARS = 320
+_RAW_FACT_MARKERS = ("[context compaction",)
+_RAW_PROMPT_PREFIX_RE = re.compile(
+    r"^(?:user standing preference:\s*)?(?:"
+    r"(?:\*\*)?(?:adoption rule|change|consequence|details|goal|requirements|"
+    r"risk|rules|source|tags|title|tweak key|verification)(?:\*\*)?:|"
+    r"you are\b|act as\b|return only\b|judge (?:this|the)\b|"
+    r"perform (?:a|an|the)\b|review (?:this|the)\b"
+    r")",
+    re.IGNORECASE,
+)
+
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
@@ -93,6 +108,27 @@ _RE_AKA          = re.compile(
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
+
+
+def _validate_fact_content(content: str) -> str:
+    """Return a crisp FactStore statement or reject transcript-like input."""
+    normalized = content.strip()
+    if not normalized:
+        raise ValueError("content must not be empty")
+    if "\n" in normalized or len(normalized) > _MAX_FACT_CONTENT_CHARS:
+        raise ValueError(
+            "FactStore entries must be a single distilled statement of at most "
+            f"{_MAX_FACT_CONTENT_CHARS} characters; split or summarize raw material first"
+        )
+    lowered = normalized.casefold()
+    if any(marker in lowered for marker in _RAW_FACT_MARKERS):
+        raise ValueError("FactStore entries must not contain compaction or handoff blobs")
+    if _RAW_PROMPT_PREFIX_RE.match(normalized):
+        raise ValueError(
+            "FactStore entries must be distilled declarative statements, not prompt "
+            "fragments or instructions"
+        )
+    return normalized
 
 
 class MemoryStore:
@@ -198,9 +234,7 @@ class MemoryStore:
         the content and links them to the fact.
         """
         with self._lock:
-            content = content.strip()
-            if not content:
-                raise ValueError("content must not be empty")
+            content = _validate_fact_content(content)
 
             try:
                 cur = self._conn.execute(
@@ -213,7 +247,10 @@ class MemoryStore:
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
-                # Duplicate content — return existing id
+                # A UNIQUE failure still leaves sqlite's implicit transaction
+                # open. Roll it back before returning the existing row so this
+                # connection cannot retain the WAL writer lock indefinitely.
+                self._conn.rollback()
                 row = self._conn.execute(
                     "SELECT fact_id FROM facts WHERE content = ?", (content,)
                 ).fetchone()
@@ -310,9 +347,11 @@ class MemoryStore:
             assignments: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
             params: list = []
 
+            updated_content: str | None = None
             if content is not None:
+                updated_content = _validate_fact_content(content)
                 assignments.append("content = ?")
-                params.append(content.strip())
+                params.append(updated_content)
             if tags is not None:
                 assignments.append("tags = ?")
                 params.append(tags)
@@ -332,18 +371,18 @@ class MemoryStore:
             self._conn.commit()
 
             # If content changed, re-extract entities
-            if content is not None:
+            if updated_content is not None:
                 self._conn.execute(
                     "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
                 )
-                for name in self._extract_entities(content):
+                for name in self._extract_entities(updated_content):
                     entity_id = self._resolve_entity(name)
                     self._link_fact_entity(fact_id, entity_id)
                 self._conn.commit()
 
             # Recompute HRR vector if content changed
-            if content is not None:
-                self._compute_hrr_vector(fact_id, content)
+            if updated_content is not None:
+                self._compute_hrr_vector(fact_id, updated_content)
             # Rebuild bank for relevant category
             cat = category or self._conn.execute(
                 "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)

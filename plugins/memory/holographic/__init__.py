@@ -24,7 +24,7 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
-from .store import MemoryStore
+from .store import MemoryStore, _MAX_FACT_CONTENT_CHARS
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
 
@@ -106,6 +106,139 @@ def _load_plugin_config() -> dict:
         return cfg_get(all_config, "plugins", "hermes-memory-store", default={}) or {}
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Auto-extraction guards
+# ---------------------------------------------------------------------------
+
+_COMMAND_CENTER_REQUEST_RE = re.compile(
+    r"James gave Archimedes a direct task/request from Command Center floating request|"
+    r"\bRun id:\s*|\bReport id:\s*|\bReport path:\s*|"
+    r"/home/[^\s]+/\.hermes/data/apps/command-center/reports/",
+    re.IGNORECASE,
+)
+
+# These are orchestration messages written by Archimedes for a fresh delivery
+# worker, not statements authored by the user. They commonly contain words such
+# as "always" and "never" because they freeze a repository slice; treating
+# those clauses as user preferences pollutes user-level recall.
+_FROZEN_SLICE_DELIVERY_PROMPT_RE = re.compile(
+    r"^\s*you\s+are\b"
+    r"(?=[\s\S]{0,700}\brepository:\s*/\S+)"
+    r"(?=[\s\S]{0,700}\b(?:mvp\s+)?slice\s+s\d+\b)",
+    re.IGNORECASE,
+)
+
+_NON_AUTHORIAL_CONTEXT_RE = re.compile(
+    r"^\s*\[(?:context compaction|conversation compaction|session handoff)\b",
+    re.IGNORECASE,
+)
+
+_DIRECT_TASK_RE = re.compile(
+    r"\b(?:i\s+(?:need|want)\s+you\s+to|what\s+i\s+need\s+to\s+do|"
+    r"tell\s+me|can\s+you|could\s+you|go\s+ahead\s+and|please)\b|"
+    r"^\s*(?:/\w+\s+)?(?:please\s+)?(?:extract|consult|fact[- ]?check|audit|build|fix|"
+    r"update|create|make|run|send|file|queue|execute|restart|re-auth|reauth|load)\b",
+    re.IGNORECASE,
+)
+
+_DURABLE_PREF_RE = re.compile(
+    r"\b(?:prefer|prefers|preferred|favorite|default|by default|always|never|usually|"
+    r"does\s+not\s+want|do\s+not\s+want|should\s+always|should\s+never|"
+    r"must\s+always|must\s+never|part\s+of\s+the\s+process|anytime)\b",
+    re.IGNORECASE,
+)
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _split_candidate_sentences(content: str) -> list[str]:
+    sentences = [s.strip(" \t\r\n\"'") for s in _SENTENCE_SPLIT_RE.split(content)]
+    return [s for s in sentences if s]
+
+
+def _looks_like_one_off_task(sentence: str) -> bool:
+    """Return True for imperative/session-specific requests, not durable prefs."""
+    if not _DIRECT_TASK_RE.search(sentence):
+        return False
+    # Explicit recurring alert rules often use imperative wording
+    # ("you need to alert me") but are still durable preferences.
+    if re.search(r"\banytime\b", sentence, re.IGNORECASE) and re.search(r"\b(?:alert|notify|notification)\b", sentence, re.IGNORECASE):
+        return False
+    # "Please always ..." and similar can be a genuine standing preference.
+    # Direct "you do X" requests are still task/procedure captures, even when
+    # they contain want/need language elsewhere in the sentence.
+    if re.search(r"\b(?:i\s+(?:need|want)\s+you\s+to|tell\s+me|what\s+i\s+need\s+to\s+do)\b", sentence, re.IGNORECASE):
+        return True
+    return not _DURABLE_PREF_RE.search(sentence)
+
+
+def _skip_auto_extraction(content: str) -> bool:
+    """Return True when a user-role message is generated orchestration context."""
+    return bool(
+        _COMMAND_CENTER_REQUEST_RE.search(content)
+        or _FROZEN_SLICE_DELIVERY_PROMPT_RE.search(content)
+        or _NON_AUTHORIAL_CONTEXT_RE.search(content)
+    )
+
+
+def _clip_auto_fact(text: str) -> str:
+    """Normalize an extracted fact to the FactStore write-boundary limit."""
+    normalized = re.sub(r"\s+", " ", text).strip(" -;:.,")
+    return normalized[:_MAX_FACT_CONTENT_CHARS].rstrip(" -;:.,")
+
+
+def _normalize_auto_pref_fact(sentence: str) -> str:
+    text = re.sub(r"\s+", " ", sentence).strip(" -;:.,")
+    text = re.sub(r"^/\w+\s*(?:also,?\s*)?", "", text, flags=re.IGNORECASE).strip()
+
+    m = re.search(r"\bI\s+prefer\s+(.+)", text, re.IGNORECASE)
+    if m:
+        return _clip_auto_fact(f"User prefers {m.group(1).strip()}")
+    m = re.search(r"\bI\s+(like|love|use)\s+(.+)", text, re.IGNORECASE)
+    if m:
+        verb = {"like": "likes", "love": "loves", "use": "uses"}[m.group(1).lower()]
+        return _clip_auto_fact(f"User {verb} {m.group(2).strip()}")
+    m = re.search(r"\bI\s+(always|never|usually)\s+(.+)", text, re.IGNORECASE)
+    if m:
+        return _clip_auto_fact(f"User {m.group(1).lower()} {m.group(2).strip()}")
+    m = re.search(r"\bmy\s+((?:favorite|preferred|default)\s+[^.]+?)\s+is\s+(.+)", text, re.IGNORECASE)
+    if m:
+        return _clip_auto_fact(f"User's {m.group(1).strip()} is {m.group(2).strip()}")
+
+    if re.match(r"^(?:james|user)\b", text, re.IGNORECASE):
+        return _clip_auto_fact(text)
+    return _clip_auto_fact(f"User standing preference: {text}")
+
+
+def _extract_auto_user_pref_facts(content: str) -> list[str]:
+    """Extract durable user preferences from a user message.
+
+    This intentionally refuses Command Center request-runner prompts,
+    Archimedes-authored frozen-slice delivery prompts, non-authorial context
+    handoffs, and imperative one-off tasks. Auto-extraction is a safety net;
+    nuanced or procedural memories should be curated explicitly by the
+    agent/skills.
+    """
+    if _skip_auto_extraction(content):
+        return []
+
+    facts: list[str] = []
+    seen: set[str] = set()
+    for sentence in _split_candidate_sentences(content):
+        if len(sentence) < 10:
+            continue
+        if not _DURABLE_PREF_RE.search(sentence):
+            continue
+        if _looks_like_one_off_task(sentence):
+            continue
+        fact = _normalize_auto_pref_fact(sentence)
+        norm = fact.casefold()
+        if norm not in seen:
+            seen.add(norm)
+            facts.append(fact)
+    return facts
 
 
 # ---------------------------------------------------------------------------
@@ -368,11 +501,10 @@ class HolographicMemoryProvider(MemoryProvider):
     # -- Auto-extraction (on_session_end) ------------------------------------
 
     def _auto_extract_facts(self, messages: list) -> None:
-        _PREF_PATTERNS = [
-            re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
-            re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
-            re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
-        ]
+        store = self._store
+        if store is None:
+            return
+
         _DECISION_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
@@ -385,24 +517,27 @@ class HolographicMemoryProvider(MemoryProvider):
             content = msg.get("content", "")
             if not isinstance(content, str) or len(content) < 10:
                 continue
+            if _skip_auto_extraction(content):
+                continue
 
-            for pattern in _PREF_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="user_pref")
-                        extracted += 1
-                    except Exception:
-                        pass
-                    break
+            for fact in _extract_auto_user_pref_facts(content):
+                try:
+                    store.add_fact(fact, category="user_pref")
+                    extracted += 1
+                except Exception:
+                    pass
 
-            for pattern in _DECISION_PATTERNS:
-                if pattern.search(content):
-                    try:
-                        self._store.add_fact(content[:400], category="project")
-                        extracted += 1
-                    except Exception:
-                        pass
+            project_fact: str | None = None
+            for sentence in _split_candidate_sentences(content):
+                if any(pattern.search(sentence) for pattern in _DECISION_PATTERNS):
+                    project_fact = _clip_auto_fact(sentence)
                     break
+            if project_fact:
+                try:
+                    store.add_fact(project_fact, category="project")
+                    extracted += 1
+                except Exception:
+                    pass
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)

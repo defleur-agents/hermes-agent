@@ -1,14 +1,17 @@
 """PTB handler-routing coverage for Telegram DM topic status updates."""
 
 import os
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+
+import pytest
 
 
 def test_registered_status_observer_matches_dm_topic_updates_without_dispatching():
     """Exercise real PTB filters in a clean interpreter, outside gateway mocks."""
+    pytest.importorskip("telegram")
     repo_root = Path(__file__).resolve().parents[1]
     script = textwrap.dedent(
         r'''

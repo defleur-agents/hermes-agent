@@ -928,6 +928,8 @@ DEFAULT_CONFIG = {
             "language": "",
             "max_words": 3,
             "max_characters": 40,
+            "style": "descriptive",
+            "instructions": "",
             "name_aliases": {},
         },
         "memory_query_rewrite": {

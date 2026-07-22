@@ -537,6 +537,24 @@ def test_cache_dm_topic_from_message_no_overwrite():
     assert adapter._dm_topics["111:General"] == 100  # unchanged
 
 
+def test_runtime_cached_topic_is_not_operator_declared():
+    adapter = _make_adapter()
+    adapter._cache_dm_topic_from_message("111", "100", "Media")
+
+    assert adapter.is_operator_declared_dm_topic("111", "100") is False
+
+
+def test_configured_topic_is_operator_declared():
+    adapter = _make_adapter([
+        {
+            "chat_id": 111,
+            "topics": [{"name": "Research", "thread_id": 100}],
+        }
+    ])
+
+    assert adapter.is_operator_declared_dm_topic("111", "100") is True
+
+
 @pytest.mark.asyncio
 async def test_forum_topic_icon_options_use_live_sticker_ids():
     adapter = _make_adapter()

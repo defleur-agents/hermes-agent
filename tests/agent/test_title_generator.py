@@ -38,6 +38,8 @@ class TestGenerateTitle:
         assert "same language the user is writing in" in system_prompt
         assert "1-3 words" in system_prompt
         assert "named project" in system_prompt
+        assert "uniquely identifies" in system_prompt
+        assert "distinguishing concept" in system_prompt
         assert "Fixing" in system_prompt
         assert "Do not include emoji" in system_prompt
 
@@ -69,6 +71,50 @@ class TestGenerateTitle:
         assert "24 characters" in system_prompt
         assert '\"project atlas\": \"ProjectAtlas\"' in system_prompt
         assert '\"atlas app\": \"ProjectAtlas\"' in system_prompt
+
+    def test_creative_style_and_user_instructions_are_configurable(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Commerce Cockpit"
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "style": "creative",
+                    "instructions": "Favor concrete systems imagery.",
+                }
+            }
+        }
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=mock_response) as llm,
+        ):
+            assert generate_title("Build an Amazon agent", "Let's map it") == "Commerce Cockpit"
+
+        system_prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "vivid, memorable" in system_prompt
+        assert "Concrete metaphors" in system_prompt
+        assert "Favor concrete systems imagery." in system_prompt
+
+    def test_collision_retry_prompt_rejects_numbered_variants(self):
+        responses = []
+        for title in ("Hermes", "Amazon Agent"):
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = title
+            responses.append(response)
+
+        with patch("agent.title_generator.call_llm", side_effect=responses) as llm:
+            assert generate_title("Compare Claude with Hermes", "Let's evaluate it") == "Hermes"
+            assert generate_title(
+                "Compare Claude with Hermes",
+                "Let's evaluate it",
+                avoid_titles=["Hermes"],
+            ) == "Amazon Agent"
+
+        retry_prompt = llm.call_args_list[1].kwargs["messages"][0]["content"]
+        assert '\"Hermes\"' in retry_prompt
+        assert "Do not append a number" in retry_prompt
 
     def test_name_aliases_match_whole_terms_not_substrings(self):
         mock_response = MagicMock()
@@ -136,6 +182,30 @@ class TestGenerateTitle:
             title = generate_title("Open the atlas app", "I will inspect it")
 
         assert title == "ProjectAtlasLongName"
+
+    def test_collision_retry_can_qualify_a_canonical_alias(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ProjectAtlas Roadmap"
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "name_aliases": {"atlas app": "ProjectAtlas"},
+                }
+            }
+        }
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=mock_response),
+        ):
+            title = generate_title(
+                "Open the atlas app roadmap",
+                "I will inspect it",
+                avoid_titles=["ProjectAtlas"],
+            )
+
+        assert title == "ProjectAtlas Roadmap"
 
     def test_name_alias_after_prompt_snippet_is_still_enforced(self):
         mock_response = MagicMock()
@@ -472,8 +542,10 @@ class TestChooseTopicIcon:
 
         assert result == "🚀"
         prompt = llm.call_args.kwargs["messages"][0]["content"]
-        assert "exactly one emoji" in prompt
+        assert "ranked" in prompt
+        assert "specific, playful visual metaphors" in prompt
         assert "📊" in prompt and "🚀" in prompt and "🛠️" in prompt
+        assert llm.call_args.kwargs["temperature"] == 0.7
 
     def test_extracts_single_allowed_emoji_from_wrapped_response(self):
         mock_response = MagicMock()
@@ -491,13 +563,74 @@ class TestChooseTopicIcon:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             assert choose_topic_icon("ProjectBolt", "fast analysis", ["⚡️", "💡"]) == "⚡️"
 
-    def test_rejects_unavailable_or_ambiguous_choice(self):
+    def test_prefers_ranked_candidate_that_was_not_used_recently(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "🚀 or 📊"
+        mock_response.choices[0].message.content = "🚀 📊 🧪"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as llm:
+            assert choose_topic_icon(
+                "Launch",
+                "compare metrics",
+                ["🚀", "📊", "🧪"],
+                recent_emojis=["🚀"],
+            ) == "📊"
+
+        prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "used recently" in prompt
+        assert "🚀" in prompt
+
+    def test_excludes_recent_icons_from_large_candidate_pool(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "💻"
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            assert choose_topic_icon("Launch", "compare metrics", ["🚀", "📊"]) is None
+            assert choose_topic_icon(
+                "Developer Tools",
+                "debug the agent",
+                ["💻", "🎨", "🧪", "🔭", "🛠️"],
+                recent_emojis=["💻"],
+            ) is None
+
+    def test_compound_emoji_wins_over_overlapping_component(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "👮‍♂️ ⚡"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert choose_topic_icon(
+                "Safety",
+                "police safety workflow",
+                ["👮", "👮‍♂️", "♂️", "⚡️"],
+            ) == "👮‍♂️"
+            assert choose_topic_icon(
+                "Safety",
+                "police safety workflow",
+                ["👮", "👮‍♂️", "♂️", "⚡️"],
+                recent_emojis=["👮‍♂️"],
+            ) == "⚡️"
+
+    def test_falls_back_to_top_ranked_candidate_when_all_were_recent(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "💻 🤖"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert choose_topic_icon(
+                "Developer Tools",
+                "debug the agent",
+                ["💻", "🤖"],
+                recent_emojis=["💻", "🤖"],
+            ) == "💻"
+
+    def test_rejects_response_without_an_allowed_candidate(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "🛸"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert choose_topic_icon("Launch", "ship it", ["🚀", "📊"]) is None
 
     def test_skips_without_allowed_icons(self):
         with patch("agent.title_generator.call_llm") as llm:
@@ -673,6 +806,62 @@ class TestMaybeAutoTitle:
                 runtime_validator=None,
             )
 
+    def test_compaction_scaffolding_does_not_suppress_first_exchange(self):
+        """Synthetic user-role compaction turns are not later human exchanges."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        from agent.context_compressor import SUMMARY_PREFIX
+
+        history = [
+            {"role": "user", "content": "build the archive"},
+            {"role": "assistant", "content": ""},
+            {"role": "tool", "content": "large result"},
+            # In-place compaction restores the human anchor, then appends
+            # user-role reference scaffolding to preserve the active task.
+            {"role": "user", "content": "build the archive"},
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\ncompressed state"},
+            {"role": "assistant", "content": "compressed summary"},
+            {
+                "role": "user",
+                "content": (
+                    "[Your active task list was preserved across context compression]"
+                    "\n- [>] verify"
+                ),
+            },
+            {"role": "assistant", "content": "archive is live"},
+        ]
+
+        import threading
+
+        callback_titles = []
+        callback_called = threading.Event()
+
+        def title_callback(title):
+            callback_titles.append(title)
+            callback_called.set()
+
+        db.get_conversation_root.return_value = "sess-1"
+        db.set_auto_title_if_empty.return_value = True
+        with patch(
+            "agent.title_generator.generate_title",
+            return_value="I Ching Archive",
+        ):
+            maybe_auto_title(
+                db,
+                "sess-1",
+                "build the archive",
+                "archive is live",
+                history,
+                title_callback=title_callback,
+            )
+            assert callback_called.wait(timeout=10), "title callback never ran"
+
+        assert callback_titles == ["I Ching Archive"]
+        db.set_auto_title_if_empty.assert_called_once_with(
+            "sess-1",
+            "I Ching Archive",
+        )
+
     def test_skips_when_title_generation_disabled(self):
         """Disabled title generation should not even start the background worker."""
         db = MagicMock()
@@ -749,6 +938,53 @@ class TestAutoTitleDuplicateHandling:
         )
         # callback fires with the actually-persisted (deduped) title
         assert seen == ["Debugging Import Error #2"]
+
+    def test_retries_numbered_fallback_after_a_concurrent_collision(self):
+        from agent.title_generator import _persist_session_title
+
+        db = MagicMock()
+        db.set_auto_title_if_empty.side_effect = [
+            ValueError("base in use"),
+            ValueError("#2 won by another worker"),
+            True,
+        ]
+        db.get_next_title_in_lineage.side_effect = [
+            "ProjectAtlas #2",
+            "ProjectAtlas #3",
+        ]
+
+        assert (
+            _persist_session_title(db, "fresh", "ProjectAtlas")
+            == "ProjectAtlas #3"
+        )
+        assert db.set_auto_title_if_empty.call_args_list[-1][0] == (
+            "fresh",
+            "ProjectAtlas #3",
+        )
+
+    def test_regenerates_a_distinctive_title_before_numbering(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="existing", source="cli")
+        db.create_session(session_id="fresh", source="telegram")
+        db.set_session_title("existing", "Hermes")
+
+        with patch(
+            "agent.title_generator.generate_title",
+            side_effect=["Hermes", "Amazon Agent"],
+        ) as generate:
+            seen = []
+            auto_title_session(
+                db,
+                "fresh",
+                "Should this Amazon operator migrate from Claude to Hermes?",
+                "Let's compare the systems.",
+                title_callback=seen.append,
+            )
+
+        assert db.get_session_title("fresh") == "Amazon Agent"
+        assert generate.call_count == 2
+        assert generate.call_args_list[1].kwargs["avoid_titles"] == ["Hermes"]
+        assert seen == ["Amazon Agent"]
 
     def test_dedupes_duplicate_title_via_lineage_legacy_store(self):
         # Store without set_auto_title_if_empty: same dedup via the plain

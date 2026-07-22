@@ -9443,6 +9443,33 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] Failed to reload dm_topics from config: %s", self.name, e)
 
+    def is_operator_declared_dm_topic(
+        self,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> bool:
+        """Return whether ``thread_id`` is explicitly managed by ``extra.dm_topics``.
+
+        ``self._dm_topics`` also contains names merely observed on incoming
+        Telegram messages. Those runtime-discovered topics remain eligible for
+        semantic auto-title and icon assignment.
+        """
+        if not thread_id:
+            return False
+        target_chat_id = str(chat_id)
+        target_thread_id = str(thread_id)
+        for chat_entry in self._dm_topics_config:
+            if str(chat_entry.get("chat_id")) != target_chat_id:
+                continue
+            for topic in chat_entry.get("topics", []):
+                configured_thread_id = topic.get("thread_id")
+                if (
+                    configured_thread_id is not None
+                    and str(configured_thread_id) == target_thread_id
+                ):
+                    return True
+        return False
+
     def _get_dm_topic_info(self, chat_id: str, thread_id: Optional[str]) -> Optional[Dict[str, Any]]:
         """Look up DM topic config by chat_id and thread_id.
 

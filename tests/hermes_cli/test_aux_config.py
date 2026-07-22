@@ -43,6 +43,8 @@ def test_title_generation_present_in_default_config():
     assert tg["extra_body"] == {}
     assert tg["max_words"] == 3
     assert tg["max_characters"] == 40
+    assert tg["style"] == "descriptive"
+    assert tg["instructions"] == ""
     assert tg["name_aliases"] == {}
 
 

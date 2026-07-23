@@ -9,6 +9,7 @@ from agent.title_generator import (
     choose_topic_icon,
     auto_title_session,
     maybe_auto_title,
+    maybe_auto_title_from_opener,
     _title_language,
 )
 from hermes_state import SessionDB
@@ -805,6 +806,77 @@ class TestMaybeAutoTitle:
                 title_callback=None,
                 runtime_validator=None,
             )
+
+    def test_opener_fires_before_first_response(self):
+        """Topic lanes can title from the opener while the main turn is running."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+
+        import threading
+
+        called = threading.Event()
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title_from_opener(
+                db,
+                "sess-opener",
+                "audit the last fourteen memory reports",
+                [],
+                main_runtime={},
+            )
+            assert called.wait(timeout=10), "opener auto-title thread never ran"
+            mock_auto.assert_called_once_with(
+                db,
+                "sess-opener",
+                "audit the last fourteen memory reports",
+                "",
+                failure_callback=None,
+                main_runtime={},
+                title_callback=None,
+                runtime_validator=None,
+            )
+
+    def test_opener_skips_after_meaningful_assistant_response(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        history = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "completed response"},
+        ]
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title_from_opener(db, "sess-old", "follow up", history)
+
+        mock_auto.assert_not_called()
+
+    def test_image_burst_titles_on_first_completed_response(self):
+        """Interrupted image rows must not consume the first-exchange window."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        history = [
+            {"role": "user", "content": "first screenshot"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "second screenshot"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "explain the screenshots"},
+            {"role": "assistant", "content": "completed response"},
+        ]
+
+        import threading
+
+        called = threading.Event()
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(
+                db,
+                "sess-burst",
+                "explain the screenshots",
+                "completed response",
+                history,
+            )
+            assert called.wait(timeout=10), "burst fallback auto-title never ran"
+
+        mock_auto.assert_called_once()
 
     def test_compaction_scaffolding_does_not_suppress_first_exchange(self):
         """Synthetic user-role compaction turns are not later human exchanges."""

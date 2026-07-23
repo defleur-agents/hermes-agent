@@ -22275,6 +22275,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._consume_pending_turn_sidecar_notes(session_key)
             )
 
+            # Telegram topic titles/icons should appear from the opener, not only
+            # after a potentially hour-long tool loop finishes. This uses the
+            # dedicated auxiliary route (explicit empty main_runtime prevents the
+            # title call from sharing the active Codex stream). The normal
+            # post-response trigger below remains a fallback.
+            if self._session_db and self._is_telegram_topic_lane(source):
+                try:
+                    from agent.title_generator import maybe_auto_title_from_opener
+
+                    def _opener_title_failure_cb(task: str, exc: BaseException) -> None:
+                        logger.debug(
+                            "Gateway opener auto-title failure suppressed "
+                            "(not user-visible): %s: %s",
+                            task,
+                            exc,
+                        )
+
+                    maybe_auto_title_from_opener(
+                        getattr(self._session_db, "_db", self._session_db),
+                        session_id,
+                        message,
+                        history,
+                        failure_callback=_opener_title_failure_cb,
+                        main_runtime={},
+                        title_callback=lambda title: self._schedule_telegram_topic_title_rename(
+                            source,
+                            session_id,
+                            title,
+                            user_message=message,
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Gateway opener auto-title scheduling failed", exc_info=True)
+
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
             _bg_review_pending_lock = threading.Lock()

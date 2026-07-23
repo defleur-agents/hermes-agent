@@ -4797,6 +4797,44 @@ class TurnRunner:
             self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
         )
 
+        # Telegram topic titles/icons should appear from the opener, not only
+        # after a potentially hour-long tool loop finishes. This uses the
+        # dedicated auxiliary route (explicit empty main_runtime prevents the
+        # title call from sharing the active Codex stream). The normal
+        # post-response trigger below remains a fallback.
+        if self._runner._session_db and self._runner._is_telegram_topic_lane(ctx.source):
+            try:
+                from agent.title_generator import maybe_auto_title_from_opener
+
+                def _opener_title_failure_cb(task: str, exc: BaseException) -> None:
+                    logger.debug(
+                        "Gateway opener auto-title failure suppressed "
+                        "(not user-visible): %s: %s",
+                        task,
+                        exc,
+                    )
+
+                maybe_auto_title_from_opener(
+                    getattr(
+                        self._runner._session_db,
+                        "_db",
+                        self._runner._session_db,
+                    ),
+                    ctx.session_id,
+                    ctx.message,
+                    ctx.history,
+                    failure_callback=_opener_title_failure_cb,
+                    main_runtime={},
+                    title_callback=lambda title: self._runner._schedule_telegram_topic_title_rename(
+                        ctx.source,
+                        ctx.session_id,
+                        title,
+                        user_message=ctx.message,
+                    ),
+                )
+            except Exception:
+                logger.debug("Gateway opener auto-title scheduling failed", exc_info=True)
+
         _bg_review_release = threading.Event()
         _bg_review_pending: list[str] = []
         _bg_review_pending_lock = threading.Lock()

@@ -1,7 +1,8 @@
-"""Auto-generate short session titles from the first user/assistant exchange.
+"""Auto-generate short session titles without blocking the main turn.
 
-Runs asynchronously after the first response is delivered so it never
-adds latency to the user-facing reply.
+Interactive topic lanes may start from the opening user message so long-running
+work receives a semantic title immediately. The traditional post-response path
+remains as a fallback and for non-topic surfaces.
 """
 
 import json
@@ -26,6 +27,9 @@ TitleCallback = Callable[[str], None]
 # after this background thread captured its runtime snapshot, and sending
 # the request would reload a model the runtime already evicted (#19027).
 RuntimeValidator = Callable[[], bool]
+
+_OPENER_TITLE_LOCK = threading.Lock()
+_OPENER_TITLES_IN_FLIGHT: set[tuple[int, str]] = set()
 
 _DEFAULT_TITLE_MAX_WORDS = 3
 _DEFAULT_TITLE_MAX_CHARACTERS = 40
@@ -688,6 +692,87 @@ def _auto_title_session(
         logger.debug("Failed to set auto-generated title: %s", e)
 
 
+def _history_message_text(message: dict) -> str:
+    """Return textual content from a persisted chat message."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or part.get("content") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+    return ""
+
+
+def _run_opener_title_worker(key: tuple[int, str], args: tuple, kwargs: dict) -> None:
+    """Run one opener title request and release its burst-deduplication claim."""
+    try:
+        auto_title_session(*args, **kwargs)
+    finally:
+        with _OPENER_TITLE_LOCK:
+            _OPENER_TITLES_IN_FLIGHT.discard(key)
+
+
+def maybe_auto_title_from_opener(
+    session_db,
+    session_id: str,
+    user_message: str,
+    conversation_history: list,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+    title_callback: Optional[TitleCallback] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
+) -> None:
+    """Start topic titling before the first agent response completes.
+
+    A prior meaningful assistant response proves this is an older exchange;
+    empty assistant rows from interrupted image bursts do not. Rapid opener
+    bursts share one in-flight request per session.
+    """
+    if not session_db or not session_id or not str(user_message or "").strip():
+        return
+    if not _auto_title_enabled():
+        return
+
+    try:
+        if session_db.get_session_title(session_id):
+            return
+    except Exception:
+        return
+
+    if any(
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and _history_message_text(msg).strip()
+        for msg in (conversation_history or [])
+    ):
+        return
+
+    key = (id(session_db), str(session_id))
+    with _OPENER_TITLE_LOCK:
+        if key in _OPENER_TITLES_IN_FLIGHT:
+            return
+        _OPENER_TITLES_IN_FLIGHT.add(key)
+
+    threading.Thread(
+        target=_run_opener_title_worker,
+        args=(
+            key,
+            (session_db, session_id, user_message, ""),
+            {
+                "failure_callback": failure_callback,
+                "main_runtime": main_runtime,
+                "title_callback": title_callback,
+                "runtime_validator": runtime_validator,
+            },
+        ),
+        daemon=True,
+        name=f"auto-title-opener-{session_id[:12]}",
+    ).start()
+
+
 def maybe_auto_title(
     session_db,
     session_id: str,
@@ -719,7 +804,19 @@ def maybe_auto_title(
         if _is_real_user_message(message)
     )
     if user_msg_count > 2:
-        return
+        # Rapid image bursts can interrupt and replace the first two attempts,
+        # leaving several human rows but only one completed assistant response.
+        # That is still the first completed exchange, so title it. A genuinely
+        # older conversation has multiple meaningful assistant responses.
+        assistant_response_count = sum(
+            1
+            for message in (conversation_history or [])
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and _history_message_text(message).strip()
+        )
+        if assistant_response_count > 1:
+            return
 
     # Config read comes after the cheap first-exchange guard so the file
     # isn't touched on every subsequent turn of a long session.

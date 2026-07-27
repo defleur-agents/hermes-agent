@@ -14,7 +14,9 @@ sqlite_master surgery path recovers the canonical data and self-heals on open.
 """
 import multiprocessing
 import os
+import shutil
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -246,6 +248,23 @@ def test_malformed_backup_reuses_unchanged_bundle(tmp_path):
     assert Path(f"{first}-shm").read_bytes() == b"shm bytes"
 
 
+def test_malformed_backup_does_not_reuse_same_stat_different_content(tmp_path):
+    """Size + preserved timestamps are metadata, not forensic identity."""
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"version one")
+    os.utime(db_path, ns=(1_000_000_000, 1_000_000_000))
+    first = hermes_state._backup_db_file(db_path)
+
+    db_path.write_bytes(b"version two")
+    os.utime(db_path, ns=(1_000_000_000, 1_000_000_000))
+    second = hermes_state._backup_db_file(db_path)
+
+    assert first is not None and second is not None
+    assert second != first
+    assert first.read_bytes() == b"version one"
+    assert second.read_bytes() == b"version two"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX repair lock regression")
 def test_concurrent_processes_share_one_repair_and_backup(tmp_path):
     db_path = tmp_path / "state.db"
@@ -274,6 +293,31 @@ def test_concurrent_processes_share_one_repair_and_backup(tmp_path):
         "drop_fts_rebuild",
     }
     assert len(hermes_state._malformed_backup_candidates(db_path)) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX repair lock regression")
+def test_repair_lock_timeout_fails_closed(tmp_path, monkeypatch):
+    import fcntl
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    lock_path = db_path.with_name(f"{db_path.name}.malformed-repair.lock")
+    lock_handle = lock_path.open("a+b")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    monkeypatch.setattr(
+        hermes_state, "_MALFORMED_REPAIR_LOCK_TIMEOUT_SECONDS", 0.15
+    )
+    started = time.monotonic()
+    try:
+        report = repair_state_db_schema(db_path)
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+    assert time.monotonic() - started < 1.0
+    assert report["repaired"] is False
+    assert report["strategy"] == "repair_lock_timeout"
+    assert "timed out" in report["error"]
 
 
 def test_malformed_backup_count_is_bounded(tmp_path, monkeypatch):
@@ -305,6 +349,22 @@ def test_malformed_backup_requires_disk_headroom(tmp_path, monkeypatch):
         hermes_state, "_MALFORMED_BACKUP_HEADROOM_BYTES", 10**30
     )
 
+    assert hermes_state._backup_db_file(db_path) is None
+    assert hermes_state._malformed_backup_candidates(db_path) == []
+
+
+def test_malformed_backup_reserves_vacuum_scratch_space(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"0123456789")
+    monkeypatch.setattr(hermes_state, "_MALFORMED_BACKUP_HEADROOM_BYTES", 10)
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: shutil._ntuple_diskusage(total=100, used=79, free=21),
+    )
+
+    # Backup bytes + static headroom would fit (20 bytes), but the repair's
+    # additional DB-sized VACUUM scratch reserve does not (30 bytes).
     assert hermes_state._backup_db_file(db_path) is None
     assert hermes_state._malformed_backup_candidates(db_path) == []
 

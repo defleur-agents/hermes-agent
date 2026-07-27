@@ -624,6 +624,116 @@ class TestPreflightCompression:
         )
 
 
+    def test_preflight_probes_provider_after_material_progress_below_safe_ceiling(self, agent):
+        """A low proactive trigger must not force an immediate no-op second pass.
+
+        Dyson regression: 436K rough tokens compressed to 189K under a 272K
+        model window, while the configured proactive trigger was 100K. The
+        old loop immediately compressed the same boundary again before real
+        provider usage could replace the noisy rough estimate. That no-op pass
+        armed the per-turn block, letting later tool results regrow unchecked.
+        """
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 272_000
+        agent.context_compressor.threshold_tokens = 100_000
+
+        big_history = []
+        for i in range(30):
+            big_history.append({"role": "user", "content": f"Message {i} padded"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded"})
+
+        ok_resp = _mock_response(content="Provider accepted the compacted turn", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        def _healthy_pass(_messages, *_args, **_kwargs):
+            compressor = agent.context_compressor
+            compressor._last_compression_made_progress = True
+            compressor._last_compression_savings_pct = 56.5
+            compressor.awaiting_real_usage_after_compression = True
+            compressor._verify_compaction_cleared_threshold = True
+            return (
+                [
+                    {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "new system prompt",
+            )
+
+        with (
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                side_effect=[436_529, 189_743, 189_743],
+            ),
+            patch(
+                "agent.conversation_loop.estimate_request_tokens_rough",
+                return_value=90_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=90_000,
+            ),
+            patch.object(agent, "_compress_context", side_effect=_healthy_pass) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        assert result["completed"] is True
+        assert mock_compress.call_count == 1
+
+    def test_preflight_safe_ceiling_reserves_provider_output_budget(self, agent):
+        """Provider probing must respect the input window after max output."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 272_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.max_tokens = 64_000
+
+        big_history = []
+        for i in range(30):
+            big_history.append({"role": "user", "content": f"Message {i} padded"})
+            big_history.append({"role": "assistant", "content": f"Response {i} padded"})
+
+        ok_resp = _mock_response(content="Provider accepted the compacted turn", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        def _healthy_pass(_messages, *_args, **_kwargs):
+            compressor = agent.context_compressor
+            compressor._last_compression_made_progress = True
+            compressor._last_compression_savings_pct = 20.0
+            compressor.awaiting_real_usage_after_compression = True
+            compressor._verify_compaction_cleared_threshold = True
+            return (
+                [
+                    {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "new system prompt",
+            )
+
+        with (
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                side_effect=[436_529, 190_000, 150_000],
+            ),
+            patch(
+                "agent.conversation_loop.estimate_request_tokens_rough",
+                return_value=90_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=90_000,
+            ),
+            patch.object(agent, "_compress_context", side_effect=_healthy_pass) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        assert result["completed"] is True
+        assert mock_compress.call_count == 2
+
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True

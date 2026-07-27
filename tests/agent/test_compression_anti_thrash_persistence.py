@@ -1,8 +1,9 @@
 """Anti-thrash state must survive process restarts (#54923).
 
 The guard in ``_automatic_compression_blocked_locally()`` trips only after two
-consecutive compactions that fail to bring the real prompt under the
-threshold. Historically ``_ineffective_compression_count`` was in-memory only:
+consecutive compactions that leave the real prompt over the threshold without
+material message savings. Historically ``_ineffective_compression_count`` was
+in-memory only:
 a fresh compressor bound to a resumed (already-compacted) session started at
 ``compression_count == 0`` with a disarmed guard, so a near-threshold session
 could legally re-compact once per process restart, forever — the exact
@@ -54,8 +55,8 @@ class TestCounterRoundTripsBindSessionState:
         db.create_session("s1", source="cli")
 
         first = _compressor(db, "s1")
-        # Two compactions that failed to clear the threshold — judged on the
-        # provider's real prompt counts, exactly as conversation_loop drives it.
+        # Two no-progress compactions that failed to clear the threshold —
+        # judged on provider real usage as conversation_loop drives it.
         for _ in range(2):
             first._verify_compaction_cleared_threshold = True
             first.update_from_response({"prompt_tokens": first.threshold_tokens + 1})
@@ -85,6 +86,37 @@ class TestCounterRoundTripsBindSessionState:
         cc.bind_session_state(db, "cold")
         assert cc._ineffective_compression_count == 0
 
+
+    def test_material_savings_do_not_trip_guard_before_context_is_exhausted(self):
+        """Dyson regression: large-progress passes may stay over the trigger.
+
+        A 436K request compressed to about 103K, then the provider reported a
+        prompt just above the configured 100K trigger.  Treating that healthy
+        76% reduction as an ineffective strike caused the second healthy pass
+        to trip the global breaker; the session then regrew to 390K and the
+        provider failed before the five-minute recovery probe could save it.
+        """
+        cc = _compressor()
+        for savings_pct in (76.0, 22.0):
+            cc._last_compression_made_progress = True
+            cc._last_compression_savings_pct = savings_pct
+            cc._verify_compaction_cleared_threshold = True
+            cc.update_from_response({"prompt_tokens": cc.threshold_tokens + 1})
+
+        assert cc._ineffective_compression_count == 0
+        assert cc.should_compress(10**9) is True
+
+    def test_low_savings_still_trip_guard_above_threshold(self):
+        """The loop breaker remains armed for genuine no-progress passes."""
+        cc = _compressor()
+        for _ in range(2):
+            cc._last_compression_made_progress = True
+            cc._last_compression_savings_pct = 9.0
+            cc._verify_compaction_cleared_threshold = True
+            cc.update_from_response({"prompt_tokens": cc.threshold_tokens + 1})
+
+        assert cc._ineffective_compression_count == 2
+        assert cc.should_compress(10**9) is False
 
 
 class TestResetSemanticsPreserved:

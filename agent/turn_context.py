@@ -926,6 +926,60 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
+                # A completed pass parks real usage until the provider sees the
+                # compacted request. When an operator configures a proactive
+                # threshold well below the model window, the rough estimator can
+                # remain above that trigger even after a large healthy reduction
+                # (tool schemas intentionally bias it high). Do not immediately
+                # compact the same boundary again: that second pass can no-op,
+                # arm the per-turn blocker, and let later tool results regrow all
+                # the way to the provider limit. Probe real usage once the rough
+                # request is below the model's normal 85% safety ceiling; truly
+                # oversized requests keep using the bounded multi-pass loop.
+                _awaiting_real_usage = bool(
+                    getattr(
+                        _compressor,
+                        "awaiting_real_usage_after_compression",
+                        False,
+                    )
+                )
+                _context_length = int(
+                    getattr(_compressor, "context_length", 0) or 0
+                )
+                _safe_usage_probe_ratio = float(
+                    getattr(_compressor, "_MIN_CTX_TRIGGER_RATIO", 0.85) or 0.85
+                )
+                _raw_output_reservation = getattr(
+                    _compressor,
+                    "max_tokens",
+                    None,
+                )
+                _output_reservation = (
+                    _raw_output_reservation
+                    if isinstance(_raw_output_reservation, int)
+                    and not isinstance(_raw_output_reservation, bool)
+                    and _raw_output_reservation > 0
+                    else 0
+                )
+                _effective_input_window = _context_length - _output_reservation
+                if _effective_input_window <= 0:
+                    _effective_input_window = _context_length
+                _safe_usage_probe_ceiling = int(
+                    _effective_input_window * _safe_usage_probe_ratio
+                )
+                if (
+                    _awaiting_real_usage
+                    and _safe_usage_probe_ceiling > 0
+                    and _preflight_tokens < _safe_usage_probe_ceiling
+                ):
+                    logger.info(
+                        "Preflight compression made material progress to ~%s "
+                        "tokens below the %s-token provider safety ceiling; "
+                        "deferring another pass until real usage is available",
+                        f"{_preflight_tokens:,}",
+                        f"{_safe_usage_probe_ceiling:,}",
+                    )
+                    break
                 if not _compressor.should_compress(_preflight_tokens):
                     break
                 if not _compression_warrants_another_preflight_pass(

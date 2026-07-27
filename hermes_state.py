@@ -804,6 +804,7 @@ def _claim_repair_attempt(db_path: Path) -> bool:
 
 _MALFORMED_BACKUP_LIMIT = 3
 _MALFORMED_BACKUP_HEADROOM_BYTES = 256 * 1024 * 1024
+_MALFORMED_REPAIR_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 @contextlib.contextmanager
@@ -822,15 +823,30 @@ def _state_db_repair_file_lock(db_path: Path):
         return
 
     import fcntl
+    import time as _time
 
     lock_path = db_path.with_name(f"{db_path.name}.malformed-repair.lock")
     fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    acquired = False
     try:
         os.chmod(lock_path, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = _time.monotonic() + _MALFORMED_REPAIR_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if _time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"timed out after {_MALFORMED_REPAIR_LOCK_TIMEOUT_SECONDS:.1f}s "
+                        f"waiting for state DB repair lock {lock_path}"
+                    )
+                _time.sleep(0.05)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -844,23 +860,97 @@ def _malformed_backup_candidates(db_path: Path) -> List[Path]:
     return sorted(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
 
 
-def _backup_bundle_matches(db_path: Path, backup_path: Path) -> bool:
-    """Cheap identity check for a copy2-preserved DB + sidecar bundle."""
+def _file_stat_fingerprint(stat_result: os.stat_result) -> Tuple[int, int, int, int, int]:
+    """Identity + mutation fingerprint for one opened/path-resolved file."""
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _files_match_exactly(source: Path, backup: Path) -> bool:
+    """Compare files byte-for-byte without accepting a path swap mid-read."""
+    source_path_before = source.stat()
+    backup_path_before = backup.stat()
+    if source_path_before.st_size != backup_path_before.st_size:
+        return False
+
+    with source.open("rb") as source_handle, backup.open("rb") as backup_handle:
+        source_handle_before = os.fstat(source_handle.fileno())
+        backup_handle_before = os.fstat(backup_handle.fileno())
+        if (
+            _file_stat_fingerprint(source_path_before)
+            != _file_stat_fingerprint(source_handle_before)
+            or _file_stat_fingerprint(backup_path_before)
+            != _file_stat_fingerprint(backup_handle_before)
+        ):
+            return False
+
+        while True:
+            source_chunk = source_handle.read(8 * 1024 * 1024)
+            backup_chunk = backup_handle.read(8 * 1024 * 1024)
+            if source_chunk != backup_chunk:
+                return False
+            if not source_chunk:
+                break
+
+        source_handle_after = os.fstat(source_handle.fileno())
+        backup_handle_after = os.fstat(backup_handle.fileno())
+        source_path_after = source.stat()
+        backup_path_after = backup.stat()
+
+    return (
+        _file_stat_fingerprint(source_path_before)
+        == _file_stat_fingerprint(source_handle_before)
+        == _file_stat_fingerprint(source_handle_after)
+        == _file_stat_fingerprint(source_path_after)
+        and _file_stat_fingerprint(backup_path_before)
+        == _file_stat_fingerprint(backup_handle_before)
+        == _file_stat_fingerprint(backup_handle_after)
+        == _file_stat_fingerprint(backup_path_after)
+    )
+
+
+def _backup_bundle_fingerprint(
+    db_path: Path, backup_path: Path
+) -> Tuple[Tuple[Optional[Tuple[int, int, int, int, int]], Optional[Tuple[int, int, int, int, int]]], ...]:
+    """Snapshot path identity/mutation state for every DB bundle member."""
+    snapshot = []
     for suffix in ("", "-wal", "-shm"):
         source = db_path.with_name(db_path.name + suffix)
         backup = backup_path.with_name(backup_path.name + suffix)
-        if source.exists() != backup.exists():
+        try:
+            source_fingerprint = _file_stat_fingerprint(source.stat())
+        except FileNotFoundError:
+            source_fingerprint = None
+        try:
+            backup_fingerprint = _file_stat_fingerprint(backup.stat())
+        except FileNotFoundError:
+            backup_fingerprint = None
+        snapshot.append((source_fingerprint, backup_fingerprint))
+    return tuple(snapshot)
+
+
+def _backup_bundle_matches(db_path: Path, backup_path: Path) -> bool:
+    """Exact identity check for a DB + WAL/SHM sidecar bundle."""
+    before = _backup_bundle_fingerprint(db_path, backup_path)
+    for index, suffix in enumerate(("", "-wal", "-shm")):
+        source = db_path.with_name(db_path.name + suffix)
+        backup = backup_path.with_name(backup_path.name + suffix)
+        source_before, backup_before = before[index]
+        if (source_before is None) != (backup_before is None):
             return False
-        if not source.exists():
+        if source_before is None:
             continue
-        source_stat = source.stat()
-        backup_stat = backup.stat()
-        if (
-            source_stat.st_size != backup_stat.st_size
-            or source_stat.st_mtime_ns != backup_stat.st_mtime_ns
-        ):
+        if not _files_match_exactly(source, backup):
             return False
-    return True
+    # Revalidate the full bundle after all reads. Otherwise state.db can be
+    # atomically replaced while a later WAL/SHM member is being compared and
+    # a stale forensic backup can be reused for the new database bytes.
+    return before == _backup_bundle_fingerprint(db_path, backup_path)
 
 
 def _backup_db_file(db_path: Path) -> Optional[Path]:
@@ -894,9 +984,30 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         return None
 
     candidates = _malformed_backup_candidates(db_path)
+    repair_reserve_bytes = db_path.stat().st_size + _MALFORMED_BACKUP_HEADROOM_BYTES
     for candidate in reversed(candidates):
         try:
             if _backup_bundle_matches(db_path, candidate):
+                free_bytes = shutil.disk_usage(db_path.parent).free
+                if free_bytes < repair_reserve_bytes:
+                    logger.error(
+                        "Forensic backup %s already preserves %s, but repair still needs %d bytes and only %d are free",
+                        candidate,
+                        db_path,
+                        repair_reserve_bytes,
+                        free_bytes,
+                    )
+                    return None
+                # Candidate validation and the headroom probe are separate
+                # operations. Revalidate after the probe so an atomic source
+                # replacement in that handoff cannot authenticate stale
+                # forensic evidence.
+                if not _backup_bundle_matches(db_path, candidate):
+                    logger.warning(
+                        "Malformed DB bundle changed after validating reusable backup %s; preserving the new source separately",
+                        candidate,
+                    )
+                    continue
                 logger.warning(
                     "Reusing unchanged malformed DB backup %s instead of copying %s again",
                     candidate,
@@ -920,7 +1031,7 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         if source.exists():
             bundle_bytes += source.stat().st_size
     free_bytes = shutil.disk_usage(db_path.parent).free
-    required_bytes = bundle_bytes + _MALFORMED_BACKUP_HEADROOM_BYTES
+    required_bytes = bundle_bytes + repair_reserve_bytes
     if free_bytes < required_bytes:
         logger.error(
             "Refusing malformed DB backup for %s: need %d bytes including headroom, only %d free",
@@ -938,6 +1049,25 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
                 shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
+        free_after_backup = shutil.disk_usage(db_path.parent).free
+        if free_after_backup < repair_reserve_bytes:
+            logger.error(
+                "Preserved malformed DB at %s but refusing repair: need %d bytes of repair reserve, only %d remain",
+                backup_path,
+                repair_reserve_bytes,
+                free_after_backup,
+            )
+            return None
+        # copy2() opens bundle members independently. Verify the complete
+        # copied bundle against the current source after all copies and the
+        # headroom probe before authorizing repair.
+        if not _backup_bundle_matches(db_path, backup_path):
+            logger.error(
+                "Malformed DB bundle changed while preserving %s at %s; refusing repair",
+                db_path,
+                backup_path,
+            )
+            return None
         return backup_path
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
@@ -1127,6 +1257,18 @@ def _repair_state_db_schema_locked(db_path: Path, *, backup: bool = True) -> Dic
             report["error"] = (
                 "refusing repair because the malformed database could not be "
                 "preserved with adequate disk headroom"
+            )
+            return report
+        # Close the return-boundary race: the source may have been replaced
+        # after _backup_db_file()'s final check but before repair begins.
+        try:
+            backup_is_current = _backup_bundle_matches(db_path, bpath)
+        except OSError:
+            backup_is_current = False
+        if not backup_is_current:
+            report["error"] = (
+                "refusing repair because the malformed database changed after "
+                "forensic preservation"
             )
             return report
 
@@ -1976,9 +2118,17 @@ def repair_state_db_schema(
 ) -> Dict[str, Any]:
     """Serialize and repair one malformed state DB across all local processes."""
     resolved = Path(db_path)
-    with _state_db_repair_file_lock(resolved):
-        # Another process may have repaired the store while this caller waited.
-        return _repair_state_db_schema_locked(resolved, backup=backup)
+    try:
+        with _state_db_repair_file_lock(resolved):
+            # Another process may have repaired the store while this caller waited.
+            return _repair_state_db_schema_locked(resolved, backup=backup)
+    except TimeoutError as exc:
+        return {
+            "repaired": False,
+            "strategy": "repair_lock_timeout",
+            "backup_path": None,
+            "error": str(exc),
+        }
 
 
 class SessionDB:

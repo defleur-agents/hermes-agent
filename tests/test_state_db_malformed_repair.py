@@ -14,7 +14,9 @@ sqlite_master surgery path recovers the canonical data and self-heals on open.
 """
 import multiprocessing
 import os
+import shutil
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -246,6 +248,143 @@ def test_malformed_backup_reuses_unchanged_bundle(tmp_path):
     assert Path(f"{first}-shm").read_bytes() == b"shm bytes"
 
 
+def test_malformed_backup_revalidates_reuse_after_headroom_check(
+    tmp_path, monkeypatch
+):
+    """A source replacement after candidate validation must force a fresh backup."""
+    db_path = tmp_path / "state.db"
+    old_bytes = b"old malformed bundle"
+    new_bytes = b"new malformed bundle"
+    db_path.write_bytes(old_bytes)
+    first = hermes_state._backup_db_file(db_path)
+    assert first is not None
+
+    replacement = tmp_path / "replacement.db"
+    replacement.write_bytes(new_bytes)
+    real_disk_usage = shutil.disk_usage
+    swapped = {"done": False}
+
+    def swap_during_headroom_check(path):
+        if not swapped["done"]:
+            swapped["done"] = True
+            os.replace(replacement, db_path)
+        usage = real_disk_usage(path)
+        return shutil._ntuple_diskusage(
+            total=usage.total, used=0, free=usage.total
+        )
+
+    monkeypatch.setattr(shutil, "disk_usage", swap_during_headroom_check)
+
+    selected = hermes_state._backup_db_file(db_path)
+
+    assert selected is not None
+    assert selected != first
+    assert first.read_bytes() == old_bytes
+    assert selected.read_bytes() == new_bytes
+    assert hermes_state._backup_bundle_matches(db_path, selected)
+
+
+def test_malformed_backup_does_not_reuse_same_stat_different_content(tmp_path):
+    """Size + preserved timestamps are metadata, not forensic identity."""
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"version one")
+    os.utime(db_path, ns=(1_000_000_000, 1_000_000_000))
+    first = hermes_state._backup_db_file(db_path)
+
+    db_path.write_bytes(b"version two")
+    os.utime(db_path, ns=(1_000_000_000, 1_000_000_000))
+    second = hermes_state._backup_db_file(db_path)
+
+    assert first is not None and second is not None
+    assert second != first
+    assert first.read_bytes() == b"version one"
+    assert second.read_bytes() == b"version two"
+
+
+def test_exact_match_rejects_atomic_source_swap_mid_read(tmp_path, monkeypatch):
+    """An opened old inode must not authenticate a new pathname target."""
+    source = tmp_path / "state.db"
+    backup = tmp_path / "state.db.malformed-backup-20260727_000000_000000"
+    replacement = tmp_path / "replacement.db"
+    source.write_bytes(b"db-before")
+    backup.write_bytes(b"db-before")
+    replacement.write_bytes(b"db-after!")
+    fixed_ns = 1_000_000_000
+    os.utime(source, ns=(fixed_ns, fixed_ns))
+    os.utime(backup, ns=(fixed_ns, fixed_ns))
+    os.utime(replacement, ns=(fixed_ns, fixed_ns))
+
+    real_open = Path.open
+
+    class _SwapAfterFirstRead:
+        def __init__(self, handle):
+            self._handle = handle
+            self._swapped = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def fileno(self):
+            return self._handle.fileno()
+
+        def read(self, *args, **kwargs):
+            chunk = self._handle.read(*args, **kwargs)
+            if not self._swapped:
+                self._swapped = True
+                os.replace(replacement, source)
+                os.utime(source, ns=(fixed_ns, fixed_ns))
+            return chunk
+
+    def swapping_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if path == source:
+            return _SwapAfterFirstRead(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", swapping_open)
+
+    assert hermes_state._files_match_exactly(source, backup) is False
+    monkeypatch.undo()
+    assert source.read_bytes() == b"db-after!"
+    assert backup.read_bytes() == b"db-before"
+
+
+def test_bundle_match_revalidates_earlier_member(tmp_path, monkeypatch):
+    """A DB swap during later WAL comparison invalidates the whole bundle."""
+    source = tmp_path / "state.db"
+    backup = tmp_path / "state.db.malformed-backup-20260727_000000_000000"
+    source.write_bytes(b"db-before")
+    backup.write_bytes(b"db-before")
+    Path(f"{source}-wal").write_bytes(b"wal-before")
+    Path(f"{backup}-wal").write_bytes(b"wal-before")
+    fixed_ns = 1_000_000_000
+    os.utime(source, ns=(fixed_ns, fixed_ns))
+    os.utime(backup, ns=(fixed_ns, fixed_ns))
+
+    real_match = hermes_state._files_match_exactly
+    calls = {"count": 0}
+
+    def swap_after_db_match(left, right):
+        matched = real_match(left, right)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            replacement = tmp_path / "replacement.db"
+            replacement.write_bytes(b"db-after!")
+            os.utime(replacement, ns=(fixed_ns, fixed_ns))
+            os.replace(replacement, source)
+            os.utime(source, ns=(fixed_ns, fixed_ns))
+        return matched
+
+    monkeypatch.setattr(hermes_state, "_files_match_exactly", swap_after_db_match)
+
+    assert hermes_state._backup_bundle_matches(source, backup) is False
+    assert source.read_bytes() == b"db-after!"
+    assert backup.read_bytes() == b"db-before"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX repair lock regression")
 def test_concurrent_processes_share_one_repair_and_backup(tmp_path):
     db_path = tmp_path / "state.db"
@@ -274,6 +413,31 @@ def test_concurrent_processes_share_one_repair_and_backup(tmp_path):
         "drop_fts_rebuild",
     }
     assert len(hermes_state._malformed_backup_candidates(db_path)) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX repair lock regression")
+def test_repair_lock_timeout_fails_closed(tmp_path, monkeypatch):
+    import fcntl
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    lock_path = db_path.with_name(f"{db_path.name}.malformed-repair.lock")
+    lock_handle = lock_path.open("a+b")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    monkeypatch.setattr(
+        hermes_state, "_MALFORMED_REPAIR_LOCK_TIMEOUT_SECONDS", 0.15
+    )
+    started = time.monotonic()
+    try:
+        report = repair_state_db_schema(db_path)
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+    assert time.monotonic() - started < 1.0
+    assert report["repaired"] is False
+    assert report["strategy"] == "repair_lock_timeout"
+    assert "timed out" in report["error"]
 
 
 def test_malformed_backup_count_is_bounded(tmp_path, monkeypatch):
@@ -309,6 +473,22 @@ def test_malformed_backup_requires_disk_headroom(tmp_path, monkeypatch):
     assert hermes_state._malformed_backup_candidates(db_path) == []
 
 
+def test_malformed_backup_reserves_vacuum_scratch_space(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"0123456789")
+    monkeypatch.setattr(hermes_state, "_MALFORMED_BACKUP_HEADROOM_BYTES", 10)
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: shutil._ntuple_diskusage(total=100, used=79, free=21),
+    )
+
+    # Backup bytes + static headroom would fit (20 bytes), but the repair's
+    # additional DB-sized VACUUM scratch reserve does not (30 bytes).
+    assert hermes_state._backup_db_file(db_path) is None
+    assert hermes_state._malformed_backup_candidates(db_path) == []
+
+
 def test_repair_fails_closed_when_forensic_backup_fails(tmp_path, monkeypatch):
     db_path = tmp_path / "state.db"
     _build_healthy_db(db_path)
@@ -322,6 +502,33 @@ def test_repair_fails_closed_when_forensic_backup_fails(tmp_path, monkeypatch):
     assert report["backup_path"] is None
     assert "refusing repair" in report["error"]
     assert db_path.read_bytes() == original
+
+
+def test_repair_revalidates_backup_before_first_mutation(tmp_path, monkeypatch):
+    """A post-backup source replacement must remain untouched and fail closed."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    backup_path = tmp_path / "state.db.malformed-backup-20260727_000000_000000"
+    shutil.copy2(db_path, backup_path)
+
+    replacement = tmp_path / "replacement.db"
+    replacement_bytes = b"replacement database bytes"
+    replacement.write_bytes(replacement_bytes)
+
+    def swap_after_backup(_path):
+        os.replace(replacement, db_path)
+        return backup_path
+
+    monkeypatch.setattr(hermes_state, "_backup_db_file", swap_after_backup)
+
+    report = repair_state_db_schema(db_path)
+
+    assert report["repaired"] is False
+    assert report["backup_path"] == str(backup_path)
+    assert "changed after forensic preservation" in report["error"]
+    assert db_path.read_bytes() == replacement_bytes
+    assert backup_path.exists()
 
 
 def test_non_malformed_error_is_not_auto_repaired(tmp_path, monkeypatch):

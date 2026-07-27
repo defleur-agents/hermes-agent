@@ -80,8 +80,8 @@ _TITLE_PROMPT_TEMPLATE = (
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
     "__LANGUAGE_RULE__\n"
-    'Good: {"title": "Fix login button on mobile"}\n'
-    'Good: {"title": "Postgres connection pool exhaustion"}\n'
+    'Good: {"title": "Fix mobile login"}\n'
+    'Good: {"title": "Postgres pool exhaustion"}\n'
     'Good: {"title": "Friendly greeting"}\n'
     'Too vague: {"title": "Code changes"}\n'
     'Too long: {"title": "Investigate and fix the issue where the login button '
@@ -253,7 +253,8 @@ def _build_title_prompt(
     # Placeholder substitution, not str.format: the prompt embeds literal JSON
     # braces as few-shot examples, which format() would try to interpolate.
     return (
-        _TITLE_PROMPT_TEMPLATE.replace("__LANGUAGE_RULE__", language_rule)
+        _TITLE_PROMPT_TEMPLATE
+        .replace("__LANGUAGE_RULE__", language_rule)
         .replace("__LENGTH_RULE__", length_rule)
         .replace("__ALIAS_RULE__", alias_rule)
     )
@@ -536,6 +537,129 @@ def generate_title(
                 failure_callback("title generation", e)
             except Exception:
                 logger.debug("Title generation failure_callback raised", exc_info=True)
+        return None
+
+
+def choose_topic_icon(
+    title: str,
+    user_message: str,
+    allowed_emojis: list[str],
+    timeout: float = 30.0,
+    *,
+    recent_emojis: Optional[list[str]] = None,
+) -> Optional[str]:
+    """Choose a varied semantic Telegram topic emoji from a live allowlist.
+
+    The auxiliary model ranks several valid candidates so the caller can avoid
+    recently used icons without sacrificing semantic fit. The returned value is
+    a normal emoji key; the Telegram adapter resolves it to the allowed
+    sticker's ``custom_emoji_id``.
+    """
+    allowed = list(
+        dict.fromkeys(str(emoji).strip() for emoji in allowed_emojis if str(emoji).strip())
+    )
+    if not allowed:
+        return None
+
+    def _emoji_key(value: str) -> str:
+        return value.replace("\ufe0e", "").replace("\ufe0f", "")
+
+    allowed_by_key = {_emoji_key(emoji): emoji for emoji in allowed}
+    recent = list(
+        dict.fromkeys(
+            allowed_by_key[key]
+            for emoji in (recent_emojis or [])
+            if (key := _emoji_key(str(emoji).strip())) in allowed_by_key
+        )
+    )
+    recent_keys = {_emoji_key(emoji) for emoji in recent}
+    fresh_allowed = [emoji for emoji in allowed if _emoji_key(emoji) not in recent_keys]
+    # When there are enough fresh choices, omit recent icons from the model's
+    # candidate pool entirely. Prompt wording and temperature are advisory;
+    # allowlist exclusion is what guarantees real rotation across the live set.
+    exclude_recent = bool(recent) and len(fresh_allowed) >= min(4, len(allowed))
+    selection_pool = fresh_allowed if exclude_recent else allowed
+    candidate_count = min(4, len(selection_pool))
+    prompt = (
+        f"Choose {candidate_count} distinct ranked emoji candidates for a conversation topic, "
+        "from best fit to least preferred. Select only from this allowed list: "
+        + json.dumps(selection_pool, ensure_ascii=False)
+        + ". Prefer specific, playful visual metaphors over generic computer, robot, or rocket "
+        "icons when a more distinctive allowed icon fits. Keep every candidate clearly related "
+        "to the topic; novelty must not override meaning. Return only the ranked emoji characters "
+        "separated by spaces, with no words or explanation."
+    )
+    if recent:
+        if exclude_recent:
+            prompt += (
+                " Icons used recently in this chat were removed from the allowed list: "
+                + json.dumps(recent, ensure_ascii=False)
+                + ". Do not return them."
+            )
+        else:
+            prompt += (
+                " These icons were used recently in this chat: "
+                + json.dumps(recent, ensure_ascii=False)
+                + ". Avoid repeating them unless one is unmistakably the best semantic fit."
+            )
+    messages = [
+        {"role": "system", "content": prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Title: {str(title or '')[:120]}\n"
+                f"Opening request: {str(user_message or '')[:500]}"
+            ),
+        },
+    ]
+
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=messages,
+            max_tokens=64,
+            temperature=0.7,
+            timeout=timeout,
+        )
+        content = response.choices[0].message.content or ""
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        choice = strip_think_blocks(None, content).strip().strip("\"'")
+        normalized_choice = _emoji_key(choice)
+
+        # Extract allowed emojis in the model's ranked response order. Matching
+        # the variation-selector-free form accepts e.g. ``⚡`` for allowed
+        # ``⚡️`` while overlap filtering keeps a compound emoji from also
+        # matching one of its component glyphs.
+        hits: list[tuple[int, int, int, str]] = []
+        for allowed_index, emoji in enumerate(selection_pool):
+            key = _emoji_key(emoji)
+            start = normalized_choice.find(key)
+            while start >= 0:
+                hits.append((start, start + len(key), allowed_index, emoji))
+                start = normalized_choice.find(key, start + max(1, len(key)))
+        hits.sort(key=lambda hit: (hit[0], -(hit[1] - hit[0]), hit[2]))
+
+        candidates: list[str] = []
+        occupied: list[tuple[int, int]] = []
+        for start, end, _, emoji in hits:
+            if any(
+                start < used_end and end > used_start
+                for used_start, used_end in occupied
+            ):
+                continue
+            occupied.append((start, end))
+            if emoji not in candidates:
+                candidates.append(emoji)
+        if not candidates:
+            return None
+
+        return next(
+            (emoji for emoji in candidates if _emoji_key(emoji) not in recent_keys),
+            candidates[0],
+        )
+    except Exception:
+        logger.debug("Telegram topic icon selection failed", exc_info=True)
         return None
 
 

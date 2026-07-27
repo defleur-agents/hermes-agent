@@ -901,6 +901,16 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
                         free_bytes,
                     )
                     return None
+                # Candidate validation and the headroom probe are separate
+                # operations. Revalidate after the probe so an atomic source
+                # replacement in that handoff cannot authenticate stale
+                # forensic evidence.
+                if not _backup_bundle_matches(db_path, candidate):
+                    logger.warning(
+                        "Malformed DB bundle changed after validating reusable backup %s; preserving the new source separately",
+                        candidate,
+                    )
+                    continue
                 logger.warning(
                     "Reusing unchanged malformed DB backup %s instead of copying %s again",
                     candidate,
@@ -949,6 +959,16 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
                 backup_path,
                 repair_reserve_bytes,
                 free_after_backup,
+            )
+            return None
+        # copy2() opens bundle members independently. Verify the complete
+        # copied bundle against the current source after all copies and the
+        # headroom probe before authorizing repair.
+        if not _backup_bundle_matches(db_path, backup_path):
+            logger.error(
+                "Malformed DB bundle changed while preserving %s at %s; refusing repair",
+                db_path,
+                backup_path,
             )
             return None
         return backup_path
@@ -1140,6 +1160,18 @@ def _repair_state_db_schema_locked(db_path: Path, *, backup: bool = True) -> Dic
             report["error"] = (
                 "refusing repair because the malformed database could not be "
                 "preserved with adequate disk headroom"
+            )
+            return report
+        # Close the return-boundary race: the source may have been replaced
+        # after _backup_db_file()'s final check but before repair begins.
+        try:
+            backup_is_current = _backup_bundle_matches(db_path, bpath)
+        except OSError:
+            backup_is_current = False
+        if not backup_is_current:
+            report["error"] = (
+                "refusing repair because the malformed database changed after "
+                "forensic preservation"
             )
             return report
 

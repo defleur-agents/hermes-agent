@@ -248,6 +248,42 @@ def test_malformed_backup_reuses_unchanged_bundle(tmp_path):
     assert Path(f"{first}-shm").read_bytes() == b"shm bytes"
 
 
+def test_malformed_backup_revalidates_reuse_after_headroom_check(
+    tmp_path, monkeypatch
+):
+    """A source replacement after candidate validation must force a fresh backup."""
+    db_path = tmp_path / "state.db"
+    old_bytes = b"old malformed bundle"
+    new_bytes = b"new malformed bundle"
+    db_path.write_bytes(old_bytes)
+    first = hermes_state._backup_db_file(db_path)
+    assert first is not None
+
+    replacement = tmp_path / "replacement.db"
+    replacement.write_bytes(new_bytes)
+    real_disk_usage = shutil.disk_usage
+    swapped = {"done": False}
+
+    def swap_during_headroom_check(path):
+        if not swapped["done"]:
+            swapped["done"] = True
+            os.replace(replacement, db_path)
+        usage = real_disk_usage(path)
+        return shutil._ntuple_diskusage(
+            total=usage.total, used=0, free=usage.total
+        )
+
+    monkeypatch.setattr(shutil, "disk_usage", swap_during_headroom_check)
+
+    selected = hermes_state._backup_db_file(db_path)
+
+    assert selected is not None
+    assert selected != first
+    assert first.read_bytes() == old_bytes
+    assert selected.read_bytes() == new_bytes
+    assert hermes_state._backup_bundle_matches(db_path, selected)
+
+
 def test_malformed_backup_does_not_reuse_same_stat_different_content(tmp_path):
     """Size + preserved timestamps are metadata, not forensic identity."""
     db_path = tmp_path / "state.db"
@@ -466,6 +502,33 @@ def test_repair_fails_closed_when_forensic_backup_fails(tmp_path, monkeypatch):
     assert report["backup_path"] is None
     assert "refusing repair" in report["error"]
     assert db_path.read_bytes() == original
+
+
+def test_repair_revalidates_backup_before_first_mutation(tmp_path, monkeypatch):
+    """A post-backup source replacement must remain untouched and fail closed."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    backup_path = tmp_path / "state.db.malformed-backup-20260727_000000_000000"
+    shutil.copy2(db_path, backup_path)
+
+    replacement = tmp_path / "replacement.db"
+    replacement_bytes = b"replacement database bytes"
+    replacement.write_bytes(replacement_bytes)
+
+    def swap_after_backup(_path):
+        os.replace(replacement, db_path)
+        return backup_path
+
+    monkeypatch.setattr(hermes_state, "_backup_db_file", swap_after_backup)
+
+    report = repair_state_db_schema(db_path)
+
+    assert report["repaired"] is False
+    assert report["backup_path"] == str(backup_path)
+    assert "changed after forensic preservation" in report["error"]
+    assert db_path.read_bytes() == replacement_bytes
+    assert backup_path.exists()
 
 
 def test_non_malformed_error_is_not_auto_repaired(tmp_path, monkeypatch):

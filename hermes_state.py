@@ -725,6 +725,67 @@ def _claim_repair_attempt(db_path: Path) -> bool:
         return True
 
 
+_MALFORMED_BACKUP_LIMIT = 3
+_MALFORMED_BACKUP_HEADROOM_BYTES = 256 * 1024 * 1024
+
+
+@contextlib.contextmanager
+def _state_db_repair_file_lock(db_path: Path):
+    """Serialize state DB repair across gateway/dashboard/CLI processes.
+
+    The in-memory repair guard is intentionally process-local.  A state DB is
+    also opened by the gateway, Dashboard, Helm workers, and CLI commands, so a
+    process-local guard alone lets every process copy and mutate the same
+    malformed multi-gigabyte database concurrently.  POSIX ``flock`` gives the
+    repair path one host-wide owner.  Windows retains the existing per-process
+    behavior until an equivalent platform lock is available.
+    """
+    if os.name == "nt":  # pragma: no cover - Windows keeps the existing guard
+        yield
+        return
+
+    import fcntl
+
+    lock_path = db_path.with_name(f"{db_path.name}.malformed-repair.lock")
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _malformed_backup_candidates(db_path: Path) -> List[Path]:
+    prefix = f"{db_path.name}.malformed-backup-"
+    candidates: List[Path] = []
+    for path in db_path.parent.glob(f"{prefix}*"):
+        stamp = path.name[len(prefix) :]
+        if re.fullmatch(r"\d{8}_\d{6}(?:_\d{6})?", stamp):
+            candidates.append(path)
+    return sorted(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def _backup_bundle_matches(db_path: Path, backup_path: Path) -> bool:
+    """Cheap identity check for a copy2-preserved DB + sidecar bundle."""
+    for suffix in ("", "-wal", "-shm"):
+        source = db_path.with_name(db_path.name + suffix)
+        backup = backup_path.with_name(backup_path.name + suffix)
+        if source.exists() != backup.exists():
+            return False
+        if not source.exists():
+            continue
+        source_stat = source.stat()
+        backup_stat = backup.stat()
+        if (
+            source_stat.st_size != backup_stat.st_size
+            or source_stat.st_mtime_ns != backup_stat.st_mtime_ns
+        ):
+            return False
+    return True
+
+
 def _backup_db_file(db_path: Path) -> Optional[Path]:
     """Copy a (possibly malformed) DB file to a timestamped backup beside it.
 
@@ -735,7 +796,44 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     import datetime
     import shutil
 
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidates = _malformed_backup_candidates(db_path)
+    for candidate in reversed(candidates):
+        try:
+            if _backup_bundle_matches(db_path, candidate):
+                logger.warning(
+                    "Reusing unchanged malformed DB backup %s instead of copying %s again",
+                    candidate,
+                    db_path,
+                )
+                return candidate
+        except OSError:
+            continue
+
+    if len(candidates) >= _MALFORMED_BACKUP_LIMIT:
+        logger.error(
+            "Malformed DB backup limit reached for %s (%d retained); refusing another copy and repair attempt",
+            db_path,
+            len(candidates),
+        )
+        return None
+
+    bundle_bytes = 0
+    for suffix in ("", "-wal", "-shm"):
+        source = db_path.with_name(db_path.name + suffix)
+        if source.exists():
+            bundle_bytes += source.stat().st_size
+    free_bytes = shutil.disk_usage(db_path.parent).free
+    required_bytes = bundle_bytes + _MALFORMED_BACKUP_HEADROOM_BYTES
+    if free_bytes < required_bytes:
+        logger.error(
+            "Refusing malformed DB backup for %s: need %d bytes including headroom, only %d free",
+            db_path,
+            required_bytes,
+            free_bytes,
+        )
+        return None
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
     try:
         shutil.copy2(db_path, backup_path)
@@ -746,6 +844,12 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         return backup_path
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
+        for suffix in ("", "-wal", "-shm"):
+            partial = backup_path.with_name(backup_path.name + suffix)
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
         return None
 
 
@@ -875,7 +979,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
-def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+def _repair_state_db_schema_locked(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -922,6 +1026,12 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     if backup:
         bpath = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
+        if bpath is None:
+            report["error"] = (
+                "refusing repair because the malformed database could not be "
+                "preserved with adequate disk headroom"
+            )
+            return report
 
     # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
     # The FTS5 'rebuild' command rewrites the internal index from the canonical
@@ -1717,6 +1827,16 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             pass
         finally:
             handle.close()
+
+
+def repair_state_db_schema(
+    db_path: Path, *, backup: bool = True
+) -> Dict[str, Any]:
+    """Serialize and repair one malformed state DB across all local processes."""
+    resolved = Path(db_path)
+    with _state_db_repair_file_lock(resolved):
+        # Another process may have repaired the store while this caller waited.
+        return _repair_state_db_schema_locked(resolved, backup=backup)
 
 
 class SessionDB:

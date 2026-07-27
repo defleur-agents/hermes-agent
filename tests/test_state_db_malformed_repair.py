@@ -12,6 +12,8 @@ journal_mode in apply_wal_with_fallback), before _init_schema runs — so it
 cannot be handled at the FTS-rebuild layer. These tests verify the
 sqlite_master surgery path recovers the canonical data and self-heals on open.
 """
+import multiprocessing
+import os
 import sqlite3
 import uuid
 from pathlib import Path
@@ -51,6 +53,11 @@ def _corrupt_duplicate_fts(db_path: Path) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def _repair_worker(db_path: str, gate, results) -> None:
+    gate.wait(timeout=10)
+    results.put(repair_state_db_schema(Path(db_path)))
 
 
 def test_duplicate_fts_makes_every_statement_fail(tmp_path):
@@ -220,6 +227,101 @@ def test_unrepairable_file_fails_safely(tmp_path, monkeypatch):
     assert report["error"]
     # The (damaged) original bytes are preserved for manual restore.
     assert report["backup_path"] and Path(report["backup_path"]).exists()
+
+
+def test_malformed_backup_reuses_unchanged_bundle(tmp_path):
+    """Independent Hermes processes must not clone the same DB repeatedly."""
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"malformed database bytes")
+    Path(f"{db_path}-wal").write_bytes(b"wal bytes")
+    Path(f"{db_path}-shm").write_bytes(b"shm bytes")
+
+    first = hermes_state._backup_db_file(db_path)
+    second = hermes_state._backup_db_file(db_path)
+
+    assert first is not None
+    assert second == first
+    assert hermes_state._malformed_backup_candidates(db_path) == [first]
+    assert Path(f"{first}-wal").read_bytes() == b"wal bytes"
+    assert Path(f"{first}-shm").read_bytes() == b"shm bytes"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX repair lock regression")
+def test_concurrent_processes_share_one_repair_and_backup(tmp_path):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+
+    ctx = multiprocessing.get_context("fork")
+    gate = ctx.Event()
+    results = ctx.Queue()
+    workers = [
+        ctx.Process(target=_repair_worker, args=(str(db_path), gate, results))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    gate.set()
+    reports = [results.get(timeout=20) for _ in workers]
+    for worker in workers:
+        worker.join(timeout=20)
+        assert worker.exitcode == 0
+
+    assert all(report["repaired"] for report in reports)
+    assert {report["strategy"] for report in reports} <= {
+        "already_healthy",
+        "dedup_schema",
+        "drop_fts_rebuild",
+    }
+    assert len(hermes_state._malformed_backup_candidates(db_path)) == 1
+
+
+def test_malformed_backup_count_is_bounded(tmp_path, monkeypatch):
+    """Distinct failed attempts retain a small forensic set, not a disk-filling loop."""
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(hermes_state, "_MALFORMED_BACKUP_LIMIT", 2)
+
+    db_path.write_bytes(b"version one")
+    os.utime(db_path, ns=(1_000_000_000, 1_000_000_000))
+    first = hermes_state._backup_db_file(db_path)
+
+    db_path.write_bytes(b"version two")
+    os.utime(db_path, ns=(2_000_000_000, 2_000_000_000))
+    second = hermes_state._backup_db_file(db_path)
+
+    db_path.write_bytes(b"version three")
+    os.utime(db_path, ns=(3_000_000_000, 3_000_000_000))
+    capped = hermes_state._backup_db_file(db_path)
+
+    assert first is not None and second is not None
+    assert capped is None
+    assert hermes_state._malformed_backup_candidates(db_path) == [first, second]
+
+
+def test_malformed_backup_requires_disk_headroom(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    db_path.write_bytes(b"malformed database bytes")
+    monkeypatch.setattr(
+        hermes_state, "_MALFORMED_BACKUP_HEADROOM_BYTES", 10**30
+    )
+
+    assert hermes_state._backup_db_file(db_path) is None
+    assert hermes_state._malformed_backup_candidates(db_path) == []
+
+
+def test_repair_fails_closed_when_forensic_backup_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_duplicate_fts(db_path)
+    original = db_path.read_bytes()
+    monkeypatch.setattr(hermes_state, "_backup_db_file", lambda _path: None)
+
+    report = repair_state_db_schema(db_path)
+
+    assert report["repaired"] is False
+    assert report["backup_path"] is None
+    assert "refusing repair" in report["error"]
+    assert db_path.read_bytes() == original
 
 
 def test_non_malformed_error_is_not_auto_repaired(tmp_path, monkeypatch):

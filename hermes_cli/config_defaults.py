@@ -720,6 +720,13 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",
             "language": "",
+            # Compact title preferences. The range guides the model; max_words
+            # and the character budget are enforced after generation.
+            "min_words": 2,
+            "max_words": 3,
+            "max_characters": 40,
+            # Case-insensitive aliases mapped to canonical display names.
+            "name_aliases": {},
         },
         "memory_query_rewrite": _aux(8, reasoning_effort=False),
         "tts_audio_tags": _aux(30),

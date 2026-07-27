@@ -1,10 +1,13 @@
-"""Auto-generate short session titles from the first user/assistant exchange.
+"""Auto-generate short session titles without blocking the main turn.
 
-Runs asynchronously after the first response is delivered so it never
-adds latency to the user-facing reply.
+Interactive topic lanes may start from the opening user message so long-running
+work receives a semantic title immediately. The traditional post-response path
+remains as a fallback and for non-topic surfaces.
 """
 
+import json
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -25,19 +28,176 @@ TitleCallback = Callable[[str], None]
 # the request would reload a model the runtime already evicted (#19027).
 RuntimeValidator = Callable[[], bool]
 
-_TITLE_PROMPT = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
-    "following exchange. The title should capture the main topic or intent. "
-    "Write the title in the same language the user is writing in. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
-)
+_OPENER_TITLE_LOCK = threading.Lock()
+_OPENER_TITLES_IN_FLIGHT: set[tuple[int, str]] = set()
 
-_TITLE_PROMPT_PINNED_LANGUAGE = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
-    "following exchange. The title should capture the main topic or intent. "
-    "Write the title in {language}. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
-)
+_DEFAULT_TITLE_MAX_WORDS = 3
+_DEFAULT_TITLE_MAX_CHARACTERS = 40
+_DEFAULT_TITLE_STYLE = "descriptive"
+_TITLE_STYLES = {"descriptive", "minimal", "creative"}
+
+
+def _coerce_bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _title_preferences() -> tuple[int, int, dict[str, str]]:
+    """Return compact-title preferences from config with safe bounds."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        title_config = (config.get("auxiliary") or {}).get("title_generation") or {}
+    except Exception:
+        logger.debug("Failed to read title-generation preferences", exc_info=True)
+        title_config = {}
+
+    max_words = _coerce_bounded_int(
+        title_config.get("max_words"),
+        default=_DEFAULT_TITLE_MAX_WORDS,
+        minimum=1,
+        maximum=10,
+    )
+    max_characters = _coerce_bounded_int(
+        title_config.get("max_characters"),
+        default=_DEFAULT_TITLE_MAX_CHARACTERS,
+        minimum=12,
+        maximum=80,
+    )
+
+    aliases: dict[str, str] = {}
+    raw_aliases = title_config.get("name_aliases")
+    if isinstance(raw_aliases, dict):
+        for raw_alias, raw_name in list(raw_aliases.items())[:50]:
+            alias = str(raw_alias or "").strip()
+            canonical = str(raw_name or "").strip()
+            if alias and canonical and len(alias) <= 80 and len(canonical) <= 80:
+                aliases[alias] = canonical
+    return max_words, max_characters, aliases
+
+
+def _title_style_preferences() -> tuple[str, str]:
+    """Return the user-selected naming style and optional prompt instruction."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        title_config = (config.get("auxiliary") or {}).get("title_generation") or {}
+    except Exception:
+        logger.debug("Failed to read title-generation style", exc_info=True)
+        title_config = {}
+
+    style = str(title_config.get("style") or _DEFAULT_TITLE_STYLE).strip().lower()
+    if style not in _TITLE_STYLES:
+        style = _DEFAULT_TITLE_STYLE
+    instructions = re.sub(
+        r"\s+",
+        " ",
+        str(title_config.get("instructions") or "").strip(),
+    )[:500]
+    return style, instructions
+
+
+def _canonical_name_for_exchange(
+    user_message: str,
+    assistant_response: str,
+    name_aliases: dict[str, str],
+) -> Optional[str]:
+    """Return the canonical name for the first configured alias in an exchange.
+
+    The prompt still encourages the model to use configured names, but this
+    post-generation lookup makes the documented case-insensitive behavior
+    deterministic. At the same position, the longest alias wins so a specific
+    alias such as ``atlas app`` takes precedence over ``atlas``.
+    """
+    if not name_aliases:
+        return None
+
+    exchange_parts = [
+        re.sub(r"\s+", " ", str(message or "")).casefold()
+        for message in (user_message, assistant_response)
+    ]
+    matches: list[tuple[int, int, int, int, str]] = []
+    for order, (raw_alias, raw_canonical) in enumerate(name_aliases.items()):
+        alias = re.sub(r"\s+", " ", str(raw_alias or "").strip()).casefold()
+        canonical = str(raw_canonical or "").strip()
+        if not alias or not canonical:
+            continue
+        pattern = rf"(?<!\w){re.escape(alias)}(?!\w)"
+        for message_order, exchange_part in enumerate(exchange_parts):
+            match = re.search(pattern, exchange_part)
+            if match:
+                matches.append(
+                    (message_order, match.start(), -len(alias), order, canonical)
+                )
+
+    return min(matches)[4] if matches else None
+
+
+def _build_title_prompt(
+    *,
+    language: str,
+    max_words: int,
+    max_characters: int,
+    name_aliases: dict[str, str],
+    style: str,
+    instructions: str,
+    avoid_titles: Optional[list[str]] = None,
+) -> str:
+    language_rule = (
+        f"Write the title in {language}."
+        if language
+        else "Write the title in the same language the user is writing in."
+    )
+    style_rules = {
+        "minimal": (
+            "Prefer the explicitly named project, product, organization, person, or place alone when "
+            "that proper name clearly and uniquely identifies the conversation."
+        ),
+        "creative": (
+            "Favor vivid, memorable, specific noun phrases. Concrete metaphors or surprising pairings "
+            "are welcome when the subject remains immediately recognizable. Use a named project or "
+            "proper name alone only when it uniquely identifies the conversation; otherwise pair it "
+            "with one distinguishing concept or intent."
+        ),
+        "descriptive": (
+            "Use a named project, product, organization, person, or place alone only when that proper "
+            "name uniquely identifies the conversation; otherwise pair it with one concrete "
+            "distinguishing concept or intent."
+        ),
+    }
+    prompt = (
+        "Generate a compact, descriptive title for a conversation that starts with the following exchange. "
+        f"Prefer 1-{max_words} words and stay within {max_characters} characters. "
+        + style_rules[style]
+        + " Preserve the spelling and capitalization of named entities. "
+        "Avoid generic action or filler words such as Fixing, Update, Setup, Analysis, Discussion, Help, "
+        "Working on, and Request unless one is essential to distinguish the subject. Do not include emoji. "
+        f"{language_rule} "
+        "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+    )
+    if instructions:
+        prompt += f" User naming preference: {instructions}"
+    rejected = [str(title).strip() for title in (avoid_titles or []) if str(title).strip()]
+    if rejected:
+        prompt += (
+            " These titles are already in use: "
+            + json.dumps(rejected[:20], ensure_ascii=False)
+            + ". Choose a meaningfully different title using a distinguishing concept from the exchange. "
+            "Do not append a number or ordinal to an existing title."
+        )
+    if name_aliases:
+        prompt += (
+            " Apply these case-insensitive canonical-name replacements whenever an alias appears in the "
+            "exchange: "
+            + json.dumps(name_aliases, ensure_ascii=False, sort_keys=True)
+            + "."
+        )
+    return prompt
 
 
 def _title_language() -> str:
@@ -78,6 +238,7 @@ def generate_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    avoid_titles: Optional[list[str]] = None,
 ) -> Optional[str]:
     """Generate a session title from the first exchange.
 
@@ -114,7 +275,17 @@ def generate_title(
     assistant_snippet = assistant_response[:500] if assistant_response else ""
 
     language = _title_language()
-    prompt = _TITLE_PROMPT_PINNED_LANGUAGE.format(language=language) if language else _TITLE_PROMPT
+    max_words, max_characters, name_aliases = _title_preferences()
+    style, instructions = _title_style_preferences()
+    prompt = _build_title_prompt(
+        language=language,
+        max_words=max_words,
+        max_characters=max_characters,
+        name_aliases=name_aliases,
+        style=style,
+        instructions=instructions,
+        avoid_titles=avoid_titles,
+    )
 
     messages = [
         {"role": "system", "content": prompt},
@@ -143,9 +314,23 @@ def generate_title(
         title = title.strip('"\'')
         if title.lower().startswith("title:"):
             title = title[6:].strip()
-        # Enforce reasonable length
-        if len(title) > 80:
-            title = title[:77] + "..."
+        canonical_name = _canonical_name_for_exchange(
+            user_message,
+            assistant_response,
+            name_aliases,
+        )
+        rejected_names = {
+            str(rejected).strip().casefold()
+            for rejected in (avoid_titles or [])
+            if str(rejected).strip()
+        }
+        if canonical_name and canonical_name.casefold() not in rejected_names:
+            # Explicit operator vocabulary wins over the generic display budget;
+            # configured canonical names are already bounded to 80 characters.
+            title = canonical_name
+        # Enforce the configured display budget when the model ignores it.
+        elif len(title) > max_characters:
+            title = title[: max_characters - 3].rstrip() + "..."
         return title if title else None
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
@@ -157,6 +342,132 @@ def generate_title(
                 failure_callback("title generation", e)
             except Exception:
                 logger.debug("Title generation failure_callback raised", exc_info=True)
+        return None
+
+
+def choose_topic_icon(
+    title: str,
+    user_message: str,
+    allowed_emojis: list[str],
+    timeout: float = 30.0,
+    *,
+    recent_emojis: Optional[list[str]] = None,
+) -> Optional[str]:
+    """Choose a varied semantic Telegram topic emoji from a live allowlist.
+
+    The auxiliary model ranks several valid candidates so the caller can avoid
+    recently used icons without sacrificing semantic fit. The returned value is
+    a normal emoji key; the Telegram adapter resolves it to the allowed
+    sticker's ``custom_emoji_id``.
+    """
+    allowed = list(
+        dict.fromkeys(
+            str(emoji).strip()
+            for emoji in allowed_emojis
+            if str(emoji).strip()
+        )
+    )
+    if not allowed:
+        return None
+
+    def _emoji_key(value: str) -> str:
+        return value.replace("\ufe0e", "").replace("\ufe0f", "")
+
+    allowed_by_key = {_emoji_key(emoji): emoji for emoji in allowed}
+    recent = list(
+        dict.fromkeys(
+            allowed_by_key[key]
+            for emoji in (recent_emojis or [])
+            if (key := _emoji_key(str(emoji).strip())) in allowed_by_key
+        )
+    )
+    recent_keys = {_emoji_key(emoji) for emoji in recent}
+    fresh_allowed = [
+        emoji for emoji in allowed if _emoji_key(emoji) not in recent_keys
+    ]
+    # When there are enough fresh choices, omit recent icons from the model's
+    # candidate pool entirely. Prompt wording and temperature are advisory;
+    # allowlist exclusion is what guarantees real rotation across the live set.
+    exclude_recent = bool(recent) and len(fresh_allowed) >= min(4, len(allowed))
+    selection_pool = fresh_allowed if exclude_recent else allowed
+    candidate_count = min(4, len(selection_pool))
+    prompt = (
+        f"Choose {candidate_count} distinct ranked emoji candidates for a conversation topic, "
+        "from best fit to least preferred. Select only from this allowed list: "
+        + json.dumps(selection_pool, ensure_ascii=False)
+        + ". Prefer specific, playful visual metaphors over generic computer, robot, or rocket "
+        "icons when a more distinctive allowed icon fits. Keep every candidate clearly related "
+        "to the topic; novelty must not override meaning. Return only the ranked emoji characters "
+        "separated by spaces, with no words or explanation."
+    )
+    if recent:
+        if exclude_recent:
+            prompt += (
+                " Icons used recently in this chat were removed from the allowed list: "
+                + json.dumps(recent, ensure_ascii=False)
+                + ". Do not return them."
+            )
+        else:
+            prompt += (
+                " These icons were used recently in this chat: "
+                + json.dumps(recent, ensure_ascii=False)
+                + ". Avoid repeating them unless one is unmistakably the best semantic fit."
+            )
+    messages = [
+        {"role": "system", "content": prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Title: {str(title or '')[:120]}\n"
+                f"Opening request: {str(user_message or '')[:500]}"
+            ),
+        },
+    ]
+
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=messages,
+            max_tokens=64,
+            temperature=0.7,
+            timeout=timeout,
+        )
+        content = response.choices[0].message.content or ""
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        choice = strip_think_blocks(None, content).strip().strip('"\'')
+        normalized_choice = _emoji_key(choice)
+
+        # Extract allowed emojis in the model's ranked response order. Matching
+        # the variation-selector-free form accepts e.g. ``⚡`` for allowed
+        # ``⚡️`` while overlap filtering keeps a compound emoji from also
+        # matching one of its component glyphs.
+        hits: list[tuple[int, int, int, str]] = []
+        for allowed_index, emoji in enumerate(selection_pool):
+            key = _emoji_key(emoji)
+            start = normalized_choice.find(key)
+            while start >= 0:
+                hits.append((start, start + len(key), allowed_index, emoji))
+                start = normalized_choice.find(key, start + max(1, len(key)))
+        hits.sort(key=lambda hit: (hit[0], -(hit[1] - hit[0]), hit[2]))
+
+        candidates: list[str] = []
+        occupied: list[tuple[int, int]] = []
+        for start, end, _, emoji in hits:
+            if any(start < used_end and end > used_start for used_start, used_end in occupied):
+                continue
+            occupied.append((start, end))
+            if emoji not in candidates:
+                candidates.append(emoji)
+        if not candidates:
+            return None
+
+        return next(
+            (emoji for emoji in candidates if _emoji_key(emoji) not in recent_keys),
+            candidates[0],
+        )
+    except Exception:
+        logger.debug("Telegram topic icon selection failed", exc_info=True)
         return None
 
 
@@ -195,16 +506,19 @@ def _persist_session_title(session_db, session_id, title):
             )
         return t
 
-    try:
-        return _set(title)
-    except ValueError:
-        next_title_fn = getattr(session_db, "get_next_title_in_lineage", None)
-        if next_title_fn is None:
-            raise
-        deduped = next_title_fn(title)
-        if not deduped or deduped == title:
-            raise
-        return _set(deduped)
+    next_title_fn = getattr(session_db, "get_next_title_in_lineage", None)
+    candidate = title
+    for _attempt in range(20):
+        try:
+            return _set(candidate)
+        except ValueError:
+            if next_title_fn is None:
+                raise
+            deduped = next_title_fn(title)
+            if not deduped or deduped == candidate:
+                raise
+            candidate = deduped
+    raise ValueError(f"unable to persist a unique title derived from {title!r}")
 
 
 def auto_title_session(
@@ -313,6 +627,31 @@ def _auto_title_session(
     if not title:
         return
 
+    # A bare duplicate such as "Hermes" is usually a weak title, and blindly
+    # numbering it produces "Hermes #4". When the store can detect an exact
+    # collision, give the model one chance to choose a distinguishing concept
+    # from the opening exchange. The existing atomic write + #N fallback still
+    # handles concurrent races and legacy stores.
+    get_by_title = getattr(type(session_db), "get_session_by_title", None)
+    if callable(get_by_title):
+        try:
+            collision = get_by_title(session_db, title)
+        except Exception:
+            collision = None
+        if collision:
+            regenerated = generate_title(
+                user_message,
+                assistant_response,
+                # The original title remains a valid numbered fallback, so an
+                # optional retry failure should not emit a user-facing warning.
+                failure_callback=None,
+                main_runtime=main_runtime,
+                runtime_validator=runtime_validator,
+                avoid_titles=[title],
+            )
+            if regenerated and regenerated.casefold() != title.casefold():
+                title = regenerated
+
     try:
         persisted = _persist_session_title(session_db, session_id, title)
         if persisted is None:
@@ -325,6 +664,87 @@ def _auto_title_session(
                 logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
         logger.debug("Failed to set auto-generated title: %s", e)
+
+
+def _history_message_text(message: dict) -> str:
+    """Return textual content from a persisted chat message."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or part.get("content") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+    return ""
+
+
+def _run_opener_title_worker(key: tuple[int, str], args: tuple, kwargs: dict) -> None:
+    """Run one opener title request and release its burst-deduplication claim."""
+    try:
+        auto_title_session(*args, **kwargs)
+    finally:
+        with _OPENER_TITLE_LOCK:
+            _OPENER_TITLES_IN_FLIGHT.discard(key)
+
+
+def maybe_auto_title_from_opener(
+    session_db,
+    session_id: str,
+    user_message: str,
+    conversation_history: list,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+    title_callback: Optional[TitleCallback] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
+) -> None:
+    """Start topic titling before the first agent response completes.
+
+    A prior meaningful assistant response proves this is an older exchange;
+    empty assistant rows from interrupted image bursts do not. Rapid opener
+    bursts share one in-flight request per session.
+    """
+    if not session_db or not session_id or not str(user_message or "").strip():
+        return
+    if not _auto_title_enabled():
+        return
+
+    try:
+        if session_db.get_session_title(session_id):
+            return
+    except Exception:
+        return
+
+    if any(
+        isinstance(msg, dict)
+        and msg.get("role") == "assistant"
+        and _history_message_text(msg).strip()
+        for msg in (conversation_history or [])
+    ):
+        return
+
+    key = (id(session_db), str(session_id))
+    with _OPENER_TITLE_LOCK:
+        if key in _OPENER_TITLES_IN_FLIGHT:
+            return
+        _OPENER_TITLES_IN_FLIGHT.add(key)
+
+    threading.Thread(
+        target=_run_opener_title_worker,
+        args=(
+            key,
+            (session_db, session_id, user_message, ""),
+            {
+                "failure_callback": failure_callback,
+                "main_runtime": main_runtime,
+                "title_callback": title_callback,
+                "runtime_validator": runtime_validator,
+            },
+        ),
+        daemon=True,
+        name=f"auto-title-opener-{session_id[:12]}",
+    ).start()
 
 
 def maybe_auto_title(
@@ -347,13 +767,30 @@ def maybe_auto_title(
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
-    # Count user messages in history to detect first exchange.
-    # conversation_history includes the exchange that just happened,
-    # so for a first exchange we expect exactly 1 user message
-    # (or 2 counting system). Be generous: generate on first 2 exchanges.
-    user_msg_count = sum(1 for m in (conversation_history or []) if m.get("role") == "user")
+    # Count human intent, not every user-role message. Context compression can
+    # inject a summary and a restored todo snapshot before a long first turn
+    # finally completes; treating that scaffolding as extra human turns skips
+    # both the session title and the paired Telegram topic icon.
+    from agent.conversation_compression import _is_real_user_message
+
+    user_msg_count = sum(
+        1 for message in (conversation_history or [])
+        if _is_real_user_message(message)
+    )
     if user_msg_count > 2:
-        return
+        # Rapid image bursts can interrupt and replace the first two attempts,
+        # leaving several human rows but only one completed assistant response.
+        # That is still the first completed exchange, so title it. A genuinely
+        # older conversation has multiple meaningful assistant responses.
+        assistant_response_count = sum(
+            1
+            for message in (conversation_history or [])
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and _history_message_text(message).strip()
+        )
+        if assistant_response_count > 1:
+            return
 
     # Config read comes after the cheap first-exchange guard so the file
     # isn't touched on every subsequent turn of a long session.

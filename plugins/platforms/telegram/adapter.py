@@ -775,6 +775,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._general_request_drain_lock = asyncio.Lock()
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
+        # Creation-time custom icon state for user-created DM topics. Missing
+        # key = unknown (usually gateway restarted); None = Telegram default
+        # bubble; string = a user-selected full-size custom topic icon.
+        self._dm_topic_creation_icons: Dict[str, Optional[str]] = {}
         # Track forum chats where we've already registered bot commands
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
@@ -3161,6 +3165,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
             topic = await self._bot.create_forum_topic(**kwargs)
             thread_id = topic.message_thread_id
+            self._remember_dm_topic_creation_icon(
+                str(chat_id), str(thread_id), icon_custom_emoji_id
+            )
             logger.info(
                 "[%s] Created DM topic '%s' in chat %s -> thread_id=%s",
                 self.name, name, chat_id, thread_id,
@@ -3265,23 +3272,77 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: int,
         thread_id: int,
         name: str,
+        icon_custom_emoji_id: Optional[str] = None,
     ) -> None:
-        """Rename a forum topic in a private (DM) chat."""
+        """Rename a private-chat topic and optionally assign a full-size icon."""
         if not self._bot:
             return
         try:
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
             chat_id_arg = chat_id
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id_arg,
+            "message_thread_id": int(thread_id),
+            "name": name,
+        }
+        if icon_custom_emoji_id:
+            kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
         await self._bot.edit_forum_topic(
-            chat_id=chat_id_arg,
-            message_thread_id=int(thread_id),
-            name=name,
+            **kwargs,
         )
         logger.info(
             "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
             self.name, chat_id, thread_id, name,
         )
+
+    async def get_forum_topic_icon_options(self) -> List[Dict[str, str]]:
+        """Return Telegram's live allowed topic emojis and custom IDs."""
+        if not self._bot:
+            return []
+        try:
+            stickers = await self._bot.get_forum_topic_icon_stickers()
+        except Exception:
+            logger.debug("[%s] Failed to fetch forum topic icon stickers", self.name, exc_info=True)
+            return []
+
+        options: List[Dict[str, str]] = []
+        seen: Set[tuple[str, str]] = set()
+        for sticker in stickers or []:
+            emoji = str(getattr(sticker, "emoji", "") or "").strip()
+            custom_id = str(getattr(sticker, "custom_emoji_id", "") or "").strip()
+            key = (emoji, custom_id)
+            if not emoji or not custom_id or key in seen:
+                continue
+            seen.add(key)
+            options.append({"emoji": emoji, "custom_emoji_id": custom_id})
+        return options
+
+    @staticmethod
+    def _dm_topic_icon_key(chat_id: str, thread_id: str) -> str:
+        return f"{chat_id}:{thread_id}"
+
+    def _remember_dm_topic_creation_icon(
+        self,
+        chat_id: str,
+        thread_id: str,
+        custom_emoji_id: Optional[str],
+    ) -> None:
+        custom_id = str(custom_emoji_id or "").strip() or None
+        self._dm_topic_creation_icons[
+            self._dm_topic_icon_key(str(chat_id), str(thread_id))
+        ] = custom_id
+
+    def dm_topic_custom_icon_state(
+        self,
+        chat_id: str,
+        thread_id: str,
+    ) -> Optional[bool]:
+        """Return True for manual custom icon, False for default, None if unknown."""
+        key = self._dm_topic_icon_key(str(chat_id), str(thread_id))
+        if key not in self._dm_topic_creation_icons:
+            return None
+        return bool(self._dm_topic_creation_icons[key])
 
     def _persist_dm_topic_thread_id(
         self,
@@ -3530,6 +3591,38 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._post_connect_task is asyncio.current_task():
                 self._post_connect_task = None
 
+    def _register_handlers(self) -> None:
+        """Register Telegram update handlers on the built application."""
+        if self._app is None:
+            return
+
+        topic_status_filter = (
+            filters.StatusUpdate.FORUM_TOPIC_CREATED
+            | filters.StatusUpdate.FORUM_TOPIC_EDITED
+        ) & filters.ChatType.PRIVATE
+        self._app.add_handler(TelegramMessageHandler(
+            topic_status_filter,
+            self._handle_dm_topic_status_update,
+        ))
+        self._app.add_handler(TelegramMessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text_message
+        ))
+        self._app.add_handler(TelegramMessageHandler(
+            filters.COMMAND,
+            self._handle_command
+        ))
+        self._app.add_handler(TelegramMessageHandler(
+            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
+            self._handle_location_message
+        ))
+        self._app.add_handler(TelegramMessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+            self._handle_media_message
+        ))
+        # Handle inline keyboard button callbacks (update prompts)
+        self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -3729,25 +3822,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
-            # Register handlers
-            self._app.add_handler(TelegramMessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._handle_text_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.COMMAND,
-                self._handle_command
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                self._handle_location_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                self._handle_media_message
-            ))
-            # Handle inline keyboard button callbacks (update prompts)
-            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            self._register_handlers()
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -8373,6 +8448,67 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _record_dm_topic_status_update(
+        self,
+        message: Message,
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Record DM topic creation/edit state without dispatching a prompt."""
+        chat = getattr(message, "chat", None)
+        chat_type = (
+            str(getattr(chat, "type", "")).split(".")[-1].lower()
+            if chat is not None
+            else ""
+        )
+        if chat_type != "private":
+            return None
+
+        effective_thread_id = thread_id or self._effective_message_thread_id(message)
+        if not effective_thread_id:
+            return None
+        chat_id = str(getattr(chat, "id", ""))
+        if not chat_id:
+            return None
+
+        created_name = None
+        created = getattr(message, "forum_topic_created", None)
+        if created:
+            created_name = str(getattr(created, "name", "") or "").strip() or None
+            self._remember_dm_topic_creation_icon(
+                chat_id,
+                effective_thread_id,
+                getattr(created, "icon_custom_emoji_id", None),
+            )
+            if created_name:
+                self._cache_dm_topic_from_message(
+                    chat_id,
+                    effective_thread_id,
+                    created_name,
+                )
+
+        # Telegram uses None when only another field changed, and an empty
+        # string when the custom icon was explicitly removed.
+        edited = getattr(message, "forum_topic_edited", None)
+        if edited:
+            edited_icon = getattr(edited, "icon_custom_emoji_id", None)
+            if edited_icon is not None:
+                self._remember_dm_topic_creation_icon(
+                    chat_id,
+                    effective_thread_id,
+                    edited_icon,
+                )
+        return created_name
+
+    async def _handle_dm_topic_status_update(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Observe forum topic service updates without dispatching them."""
+        message = self._effective_update_message(update)
+        if message is not None:
+            self._record_dm_topic_status_update(message)
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -9076,6 +9212,33 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] Failed to reload dm_topics from config: %s", self.name, e)
 
+    def is_operator_declared_dm_topic(
+        self,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> bool:
+        """Return whether ``thread_id`` is explicitly managed by ``extra.dm_topics``.
+
+        ``self._dm_topics`` also contains names merely observed on incoming
+        Telegram messages. Those runtime-discovered topics remain eligible for
+        semantic auto-title and icon assignment.
+        """
+        if not thread_id:
+            return False
+        target_chat_id = str(chat_id)
+        target_thread_id = str(thread_id)
+        for chat_entry in self._dm_topics_config:
+            if str(chat_entry.get("chat_id")) != target_chat_id:
+                continue
+            for topic in chat_entry.get("topics", []):
+                configured_thread_id = topic.get("thread_id")
+                if (
+                    configured_thread_id is not None
+                    and str(configured_thread_id) == target_thread_id
+                ):
+                    return True
+        return False
+
     def _get_dm_topic_info(self, chat_id: str, thread_id: Optional[str]) -> Optional[Dict[str, Any]]:
         """Look up DM topic config by chat_id and thread_id.
 
@@ -9239,13 +9402,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_topic = topic_info.get("name")
                 topic_skill = topic_info.get("skill")
 
-            # Also check forum_topic_created service message for topic discovery
-            if hasattr(message, "forum_topic_created") and message.forum_topic_created:
-                created_name = message.forum_topic_created.name
-                if created_name:
-                    self._cache_dm_topic_from_message(str(chat.id), thread_id_str, created_name)
-                    if not chat_topic:
-                        chat_topic = created_name
+            # Status updates normally arrive through the dedicated observer,
+            # but keep this idempotent fallback for direct event builders.
+            created_name = self._record_dm_topic_status_update(
+                message,
+                thread_id=thread_id_str,
+            )
+            if created_name and not chat_topic:
+                chat_topic = created_name
 
         elif chat_type == "group" and thread_id_str:
             # Group/supergroup forum topic skill binding via config.extra['group_topics'].

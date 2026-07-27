@@ -265,6 +265,90 @@ def test_malformed_backup_does_not_reuse_same_stat_different_content(tmp_path):
     assert second.read_bytes() == b"version two"
 
 
+def test_exact_match_rejects_atomic_source_swap_mid_read(tmp_path, monkeypatch):
+    """An opened old inode must not authenticate a new pathname target."""
+    source = tmp_path / "state.db"
+    backup = tmp_path / "state.db.malformed-backup-20260727_000000_000000"
+    replacement = tmp_path / "replacement.db"
+    source.write_bytes(b"db-before")
+    backup.write_bytes(b"db-before")
+    replacement.write_bytes(b"db-after!")
+    fixed_ns = 1_000_000_000
+    os.utime(source, ns=(fixed_ns, fixed_ns))
+    os.utime(backup, ns=(fixed_ns, fixed_ns))
+    os.utime(replacement, ns=(fixed_ns, fixed_ns))
+
+    real_open = Path.open
+
+    class _SwapAfterFirstRead:
+        def __init__(self, handle):
+            self._handle = handle
+            self._swapped = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def fileno(self):
+            return self._handle.fileno()
+
+        def read(self, *args, **kwargs):
+            chunk = self._handle.read(*args, **kwargs)
+            if not self._swapped:
+                self._swapped = True
+                os.replace(replacement, source)
+                os.utime(source, ns=(fixed_ns, fixed_ns))
+            return chunk
+
+    def swapping_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if path == source:
+            return _SwapAfterFirstRead(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", swapping_open)
+
+    assert hermes_state._files_match_exactly(source, backup) is False
+    monkeypatch.undo()
+    assert source.read_bytes() == b"db-after!"
+    assert backup.read_bytes() == b"db-before"
+
+
+def test_bundle_match_revalidates_earlier_member(tmp_path, monkeypatch):
+    """A DB swap during later WAL comparison invalidates the whole bundle."""
+    source = tmp_path / "state.db"
+    backup = tmp_path / "state.db.malformed-backup-20260727_000000_000000"
+    source.write_bytes(b"db-before")
+    backup.write_bytes(b"db-before")
+    Path(f"{source}-wal").write_bytes(b"wal-before")
+    Path(f"{backup}-wal").write_bytes(b"wal-before")
+    fixed_ns = 1_000_000_000
+    os.utime(source, ns=(fixed_ns, fixed_ns))
+    os.utime(backup, ns=(fixed_ns, fixed_ns))
+
+    real_match = hermes_state._files_match_exactly
+    calls = {"count": 0}
+
+    def swap_after_db_match(left, right):
+        matched = real_match(left, right)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            replacement = tmp_path / "replacement.db"
+            replacement.write_bytes(b"db-after!")
+            os.utime(replacement, ns=(fixed_ns, fixed_ns))
+            os.replace(replacement, source)
+            os.utime(source, ns=(fixed_ns, fixed_ns))
+        return matched
+
+    monkeypatch.setattr(hermes_state, "_files_match_exactly", swap_after_db_match)
+
+    assert hermes_state._backup_bundle_matches(source, backup) is False
+    assert source.read_bytes() == b"db-after!"
+    assert backup.read_bytes() == b"db-before"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX repair lock regression")
 def test_concurrent_processes_share_one_repair_and_backup(tmp_path):
     db_path = tmp_path / "state.db"

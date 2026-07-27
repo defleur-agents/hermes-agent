@@ -783,14 +783,35 @@ def _malformed_backup_candidates(db_path: Path) -> List[Path]:
     return sorted(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
 
 
+def _file_stat_fingerprint(stat_result: os.stat_result) -> Tuple[int, int, int, int, int]:
+    """Identity + mutation fingerprint for one opened/path-resolved file."""
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
 def _files_match_exactly(source: Path, backup: Path) -> bool:
-    """Compare two files byte-for-byte and reject a source that changes mid-read."""
-    source_before = source.stat()
-    backup_before = backup.stat()
-    if source_before.st_size != backup_before.st_size:
+    """Compare files byte-for-byte without accepting a path swap mid-read."""
+    source_path_before = source.stat()
+    backup_path_before = backup.stat()
+    if source_path_before.st_size != backup_path_before.st_size:
         return False
 
     with source.open("rb") as source_handle, backup.open("rb") as backup_handle:
+        source_handle_before = os.fstat(source_handle.fileno())
+        backup_handle_before = os.fstat(backup_handle.fileno())
+        if (
+            _file_stat_fingerprint(source_path_before)
+            != _file_stat_fingerprint(source_handle_before)
+            or _file_stat_fingerprint(backup_path_before)
+            != _file_stat_fingerprint(backup_handle_before)
+        ):
+            return False
+
         while True:
             source_chunk = source_handle.read(8 * 1024 * 1024)
             backup_chunk = backup_handle.read(8 * 1024 * 1024)
@@ -799,28 +820,60 @@ def _files_match_exactly(source: Path, backup: Path) -> bool:
             if not source_chunk:
                 break
 
-    source_after = source.stat()
-    backup_after = backup.stat()
+        source_handle_after = os.fstat(source_handle.fileno())
+        backup_handle_after = os.fstat(backup_handle.fileno())
+        source_path_after = source.stat()
+        backup_path_after = backup.stat()
+
     return (
-        source_before.st_size == source_after.st_size
-        and source_before.st_mtime_ns == source_after.st_mtime_ns
-        and backup_before.st_size == backup_after.st_size
-        and backup_before.st_mtime_ns == backup_after.st_mtime_ns
+        _file_stat_fingerprint(source_path_before)
+        == _file_stat_fingerprint(source_handle_before)
+        == _file_stat_fingerprint(source_handle_after)
+        == _file_stat_fingerprint(source_path_after)
+        and _file_stat_fingerprint(backup_path_before)
+        == _file_stat_fingerprint(backup_handle_before)
+        == _file_stat_fingerprint(backup_handle_after)
+        == _file_stat_fingerprint(backup_path_after)
     )
+
+
+def _backup_bundle_fingerprint(
+    db_path: Path, backup_path: Path
+) -> Tuple[Tuple[Optional[Tuple[int, int, int, int, int]], Optional[Tuple[int, int, int, int, int]]], ...]:
+    """Snapshot path identity/mutation state for every DB bundle member."""
+    snapshot = []
+    for suffix in ("", "-wal", "-shm"):
+        source = db_path.with_name(db_path.name + suffix)
+        backup = backup_path.with_name(backup_path.name + suffix)
+        try:
+            source_fingerprint = _file_stat_fingerprint(source.stat())
+        except FileNotFoundError:
+            source_fingerprint = None
+        try:
+            backup_fingerprint = _file_stat_fingerprint(backup.stat())
+        except FileNotFoundError:
+            backup_fingerprint = None
+        snapshot.append((source_fingerprint, backup_fingerprint))
+    return tuple(snapshot)
 
 
 def _backup_bundle_matches(db_path: Path, backup_path: Path) -> bool:
     """Exact identity check for a DB + WAL/SHM sidecar bundle."""
-    for suffix in ("", "-wal", "-shm"):
+    before = _backup_bundle_fingerprint(db_path, backup_path)
+    for index, suffix in enumerate(("", "-wal", "-shm")):
         source = db_path.with_name(db_path.name + suffix)
         backup = backup_path.with_name(backup_path.name + suffix)
-        if source.exists() != backup.exists():
+        source_before, backup_before = before[index]
+        if (source_before is None) != (backup_before is None):
             return False
-        if not source.exists():
+        if source_before is None:
             continue
         if not _files_match_exactly(source, backup):
             return False
-    return True
+    # Revalidate the full bundle after all reads. Otherwise state.db can be
+    # atomically replaced while a later WAL/SHM member is being compared and
+    # a stale forensic backup can be reused for the new database bytes.
+    return before == _backup_bundle_fingerprint(db_path, backup_path)
 
 
 def _backup_db_file(db_path: Path) -> Optional[Path]:

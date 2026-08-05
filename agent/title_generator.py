@@ -345,7 +345,10 @@ def generate_title(
             for rejected in (avoid_titles or [])
             if str(rejected).strip()
         }
-        if canonical_name and canonical_name.casefold() not in rejected_names:
+        canonical_name_applied = bool(
+            canonical_name and canonical_name.casefold() not in rejected_names
+        )
+        if canonical_name_applied:
             # Explicit operator vocabulary wins over the generic display budget;
             # configured canonical names are already bounded to 80 characters.
             title = canonical_name
@@ -355,7 +358,7 @@ def generate_title(
         # non-empty line — the closest thing to a title in that response.
         title = next((line.strip() for line in title.splitlines() if line.strip()), "")
         # Enforce the configured display budget when the model ignores it.
-        if not canonical_name and len(title) > max_characters:
+        if not canonical_name_applied and len(title) > max_characters:
             title = title[: max_characters - 3].rstrip() + "..."
         return title if title else None
     except Exception as e:

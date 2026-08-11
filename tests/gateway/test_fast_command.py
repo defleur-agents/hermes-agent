@@ -256,6 +256,73 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_telegram_topic_titles_from_opener_before_final_response(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    session_db = MagicMock()
+    session_db.is_telegram_topic_mode_enabled.return_value = True
+    runner._session_db = SimpleNamespace(_db=session_db)  # type: ignore[assignment]
+
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    source = _make_source()
+    source.thread_id = "42"
+    monkeypatch.setattr(runner, "_is_telegram_topic_lane", lambda source: True)
+    with (
+        patch("agent.title_generator.maybe_auto_title_from_opener") as mock_opener,
+        patch("agent.title_generator.maybe_auto_title") as mock_final,
+    ):
+        result = await runner._run_agent(
+            message="audit the last fourteen memory reports",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key="agent:main:telegram:dm:12345:42",
+        )
+
+    assert result["final_response"] == "ok"
+    mock_opener.assert_called_once()
+    assert mock_opener.call_args.args[:4] == (
+        session_db,
+        "session-1",
+        "audit the last fourteen memory reports",
+        [],
+    )
+    assert mock_opener.call_args.kwargs["main_runtime"] == {}
+    mock_final.assert_called_once()
+
+    callback = mock_opener.call_args.kwargs["title_callback"]
+    with patch.object(runner, "_schedule_telegram_topic_title_rename") as mock_schedule:
+        callback("Memory Audit Reckoning")
+    mock_schedule.assert_called_once_with(
+        source,
+        "session-1",
+        "Memory Audit Reckoning",
+        user_message="audit the last fourteen memory reports",
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()

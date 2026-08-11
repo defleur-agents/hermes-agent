@@ -2140,13 +2140,19 @@ class ContextCompressor(ContextEngine):
 
             # Anti-thrashing verdict, judged HERE because this is the only place
             # that sees the provider's real prompt count for the just-compacted
-            # conversation. Effectiveness is "did the prompt get under the
-            # threshold?", not "did the message list shrink?": compaction can
-            # only shrink messages, while the system prompt and tool schemas are
-            # an incompressible floor (with 50+ tools, 20-30K tokens — see
-            # #14695). When that floor alone meets the threshold, every pass
-            # shrinks messages by a healthy margin yet leaves the prompt over the
-            # line, so the next turn compacts again, forever.
+            # conversation. A completed boundary is ineffective only when BOTH:
+            #
+            # 1. the real prompt remains above the configured threshold; and
+            # 2. the boundary failed to make material message-level progress.
+            #
+            # The second condition matters for multi-pass recovery. A large
+            # transcript can shrink by 50-80% and still land just above a low
+            # proactive threshold because the system prompt and tool schemas form
+            # an incompressible floor. Counting that healthy pass as a strike can
+            # trip the breaker while another summary pass would finish recovery;
+            # the blocked session then regrows into the provider's hard limit.
+            # Genuine floor/no-op loops still trip after two passes below the 10%
+            # material-progress boundary.
             #
             # It must NOT live in should_compress(): that runs twice per turn
             # with two different measures (a rough preflight estimate and the
@@ -2155,21 +2161,32 @@ class ContextCompressor(ContextEngine):
             # Keying on real usage compares like with like and fires exactly once
             # per compaction.
             if self._verify_compaction_cleared_threshold:
-                if self.last_prompt_tokens >= self.threshold_tokens:
+                _material_progress = (
+                    self._last_compression_made_progress
+                    and self._last_compression_savings_pct >= 10.0
+                )
+                if (
+                    self.last_prompt_tokens >= self.threshold_tokens
+                    and not _material_progress
+                ):
                     self._record_ineffective_compression_verdict(
                         self._ineffective_compression_count + 1,
                     )
                     if not self.quiet_mode:
                         logger.warning(
-                            "Compaction did not clear the threshold: %d real "
-                            "tokens still >= %d. The incompressible prompt "
-                            "(system prompt + tool schemas) may already exceed "
-                            "it, in which case shrinking messages cannot help. "
+                            "Compaction did not restore healthy context: %d real "
+                            "tokens still >= %d and message savings were only "
+                            "%.1f%%. The incompressible prompt (system prompt + "
+                            "tool schemas) may already exceed the threshold. "
                             "ineffective_compression_count=%d",
-                            self.last_prompt_tokens, self.threshold_tokens,
+                            self.last_prompt_tokens,
+                            self.threshold_tokens,
+                            self._last_compression_savings_pct,
                             self._ineffective_compression_count,
                         )
                 else:
+                    # A fitting real prompt OR a materially shrinking boundary
+                    # proves the breaker must stay open for continued recovery.
                     self._record_ineffective_compression_verdict(0)
         # Consume the pending-verification flag once real usage arrives, whether
         # or not prompt_tokens was reported, so a usage-less response can't leave

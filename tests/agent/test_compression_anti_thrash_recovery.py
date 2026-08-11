@@ -1,8 +1,9 @@
 """Anti-thrash recovery: the tripped guard must not be permanent (#14694).
 
-When two consecutive compactions each fail to clear the threshold, the
-anti-thrashing breaker blocks automatic compaction. Before this fix the block
-was permanent for the life of the session: nothing ever decremented
+When two consecutive compactions each fail to clear the threshold without
+material message savings, the anti-thrashing breaker blocks automatic
+compaction. Before this fix the block was permanent for the life of the
+session: nothing ever decremented
 ``_ineffective_compression_count`` (or ``_fallback_compression_streak``)
 while blocked, so a session whose middle region was briefly too small to
 compact never auto-compacted again — it grew unbounded until the provider's

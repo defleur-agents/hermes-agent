@@ -525,11 +525,21 @@ def _fetch_codex_account_usage(
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key, default_label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
             continue
+        # The backend normally returns 5-hour primary + 7-day secondary
+        # windows, but Pro accounts can collapse to one seven-day primary
+        # window. Classify by the explicit duration when present rather than
+        # assuming the primary/secondary position defines the quota period.
+        window_seconds = window.get("limit_window_seconds")
+        label = (
+            "Weekly"
+            if isinstance(window_seconds, (int, float)) and window_seconds >= 6 * 24 * 60 * 60
+            else default_label
+        )
         windows.append(
             AccountUsageWindow(
                 label=label,

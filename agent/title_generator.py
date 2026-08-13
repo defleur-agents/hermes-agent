@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import threading
+from contextvars import copy_context
 from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
@@ -67,16 +68,20 @@ _TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Given the user's opening message, write a title "
     "that lets them find this conversation again in a list.\n\n"
     "Rules:\n"
-    "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n"
+    "__LENGTH_RULE__\n"
     "- Name what the user wants DONE, not that they asked a question.\n"
+    "- Prefer an explicitly named project, person, product, or other proper name.\n"
+    "- Avoid generic leading labels such as Fixing, Update, or Analysis when a specific subject is available.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
+    "__ALIAS_RULE__"
     "- Drop filler words: the, this, my, a, an.\n"
+    "- Do not include emoji.\n"
     "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
     "__LANGUAGE_RULE__\n"
-    'Good: {"title": "Fix login button on mobile"}\n'
-    'Good: {"title": "Postgres connection pool exhaustion"}\n'
+    'Good: {"title": "Fix mobile login"}\n'
+    'Good: {"title": "Postgres pool exhaustion"}\n'
     'Good: {"title": "Friendly greeting"}\n'
     'Too vague: {"title": "Code changes"}\n'
     'Too long: {"title": "Investigate and fix the issue where the login button '
@@ -157,6 +162,102 @@ def _title_language() -> str:
         ).strip()
     except Exception:
         return ""
+
+
+def _title_preferences() -> tuple[int, int, int, dict[str, str]]:
+    """Return compact-title limits and user-defined canonical aliases."""
+    default_min_words = 2
+    default_max_words = 3
+    default_max_characters = 40
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        title_config = ((load_config_readonly() or {}).get("auxiliary") or {}).get(
+            "title_generation", {}
+        )
+        max_words = max(
+            1, min(int(title_config.get("max_words", default_max_words)), 12)
+        )
+        min_words = max(
+            1,
+            min(
+                int(title_config.get("min_words", default_min_words)),
+                max_words,
+            ),
+        )
+        max_characters = max(
+            12,
+            min(
+                int(title_config.get("max_characters", default_max_characters)),
+                120,
+            ),
+        )
+        raw_aliases = title_config.get("name_aliases", {})
+        aliases = (
+            {
+                str(alias).strip(): str(canonical).strip()
+                for alias, canonical in raw_aliases.items()
+                if str(alias).strip() and str(canonical).strip()
+            }
+            if isinstance(raw_aliases, dict)
+            else {}
+        )
+        return min_words, max_words, max_characters, aliases
+    except Exception:
+        return default_min_words, default_max_words, default_max_characters, {}
+
+
+def _canonical_name_for_message(
+    user_message: str, name_aliases: dict[str, str]
+) -> Optional[str]:
+    """Return the canonical name for the longest whole-term alias match."""
+    for alias, canonical in sorted(
+        name_aliases.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", user_message, re.IGNORECASE):
+            return canonical
+    return None
+
+
+def _build_title_prompt(
+    *,
+    language: str,
+    min_words: int,
+    max_words: int,
+    max_characters: int,
+    name_aliases: dict[str, str],
+) -> str:
+    """Build the structured-output title prompt from user preferences."""
+    language_rule = (
+        _LANGUAGE_RULE_PINNED.format(language=language)
+        if language
+        else _LANGUAGE_RULE_MATCH_USER
+    )
+    if min_words == max_words:
+        word_preference = f"exactly {max_words} " + (
+            "word" if max_words == 1 else "words"
+        )
+    else:
+        word_preference = f"{min_words}-{max_words} words"
+    length_rule = (
+        f"- Prefer {word_preference} and at most {max_characters} characters; "
+        "use sentence case (capitalize only the first word and proper nouns)."
+    )
+    alias_rule = ""
+    if name_aliases:
+        aliases_json = json.dumps(name_aliases, ensure_ascii=False, sort_keys=True)
+        alias_rule = (
+            "- Use these case-insensitive canonical name replacements when the "
+            f"opening message contains an alias: {aliases_json}.\n"
+        )
+    # Placeholder substitution, not str.format: the prompt embeds literal JSON
+    # braces as few-shot examples, which format() would try to interpolate.
+    return (
+        _TITLE_PROMPT_TEMPLATE
+        .replace("__LANGUAGE_RULE__", language_rule)
+        .replace("__LENGTH_RULE__", length_rule)
+        .replace("__ALIAS_RULE__", alias_rule)
+    )
 
 
 def _auto_title_enabled() -> bool:
@@ -315,7 +416,7 @@ def _extract_title_text(content: str) -> str:
     return raw.strip("\"'").strip()
 
 
-def _clean_title(text: str) -> Optional[str]:
+def _clean_title(text: str, max_characters: int = 80) -> Optional[str]:
     """Normalize a model-produced title, or None when nothing usable remains."""
     title = " ".join((text or "").split())
     title = title.strip("\"'").strip()
@@ -325,9 +426,19 @@ def _clean_title(text: str) -> Optional[str]:
     title = title.rstrip(".!,;:")
     if not title:
         return None
-    if len(title) > 80:
-        title = title[:77].rstrip() + "..."
+    if len(title) > max_characters:
+        title = title[: max_characters - 3].rstrip() + "..."
     return title
+
+
+def _enforce_max_words(title: Optional[str], max_words: int) -> Optional[str]:
+    """Deterministically enforce the configured title word maximum."""
+    if not title:
+        return None
+    words = title.split()
+    if len(words) <= max_words:
+        return title
+    return " ".join(words[:max_words]).rstrip(".!,;:")
 
 
 def generate_title(
@@ -372,19 +483,23 @@ def generate_title(
             # Fail open: a broken validator must not disable titling.
             logger.debug("Title runtime validator raised; proceeding", exc_info=True)
 
-    user_snippet = _summarize_user_message(user_message)[:MAX_TITLE_INPUT_CHARS]
+    # Collapse slash-skill scaffolding before prompt construction, deterministic
+    # alias matching, and truncation. Hidden expanded skill prose must not win
+    # over the user's visible instruction.
+    summarized_user_message = _summarize_user_message(user_message)
+    user_snippet = summarized_user_message[:MAX_TITLE_INPUT_CHARS]
     if not user_snippet.strip():
         return None
 
     language = _title_language()
-    language_rule = (
-        _LANGUAGE_RULE_PINNED.format(language=language)
-        if language
-        else _LANGUAGE_RULE_MATCH_USER
+    min_words, max_words, max_characters, name_aliases = _title_preferences()
+    prompt = _build_title_prompt(
+        language=language,
+        min_words=min_words,
+        max_words=max_words,
+        max_characters=max_characters,
+        name_aliases=name_aliases,
     )
-    # Placeholder substitution, not str.format: the prompt embeds literal JSON
-    # braces as few-shot examples, which format() would try to interpolate.
-    prompt = _TITLE_PROMPT_TEMPLATE.replace("__LANGUAGE_RULE__", language_rule)
 
     messages = [
         {"role": "system", "content": prompt},
@@ -404,7 +519,14 @@ def generate_title(
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
         content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
+        title = _clean_title(_extract_title_text(content), max_characters)
+        canonical_name = _canonical_name_for_message(
+            summarized_user_message, name_aliases
+        )
+        # Canonical names are explicit user config and intentionally outrank the
+        # generic character preference. The word maximum remains a deterministic
+        # display policy for both model output and configured aliases.
+        return _enforce_max_words(canonical_name or title, max_words)
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
@@ -415,6 +537,129 @@ def generate_title(
                 failure_callback("title generation", e)
             except Exception:
                 logger.debug("Title generation failure_callback raised", exc_info=True)
+        return None
+
+
+def choose_topic_icon(
+    title: str,
+    user_message: str,
+    allowed_emojis: list[str],
+    timeout: float = 30.0,
+    *,
+    recent_emojis: Optional[list[str]] = None,
+) -> Optional[str]:
+    """Choose a varied semantic Telegram topic emoji from a live allowlist.
+
+    The auxiliary model ranks several valid candidates so the caller can avoid
+    recently used icons without sacrificing semantic fit. The returned value is
+    a normal emoji key; the Telegram adapter resolves it to the allowed
+    sticker's ``custom_emoji_id``.
+    """
+    allowed = list(
+        dict.fromkeys(str(emoji).strip() for emoji in allowed_emojis if str(emoji).strip())
+    )
+    if not allowed:
+        return None
+
+    def _emoji_key(value: str) -> str:
+        return value.replace("\ufe0e", "").replace("\ufe0f", "")
+
+    allowed_by_key = {_emoji_key(emoji): emoji for emoji in allowed}
+    recent = list(
+        dict.fromkeys(
+            allowed_by_key[key]
+            for emoji in (recent_emojis or [])
+            if (key := _emoji_key(str(emoji).strip())) in allowed_by_key
+        )
+    )
+    recent_keys = {_emoji_key(emoji) for emoji in recent}
+    fresh_allowed = [emoji for emoji in allowed if _emoji_key(emoji) not in recent_keys]
+    # When there are enough fresh choices, omit recent icons from the model's
+    # candidate pool entirely. Prompt wording and temperature are advisory;
+    # allowlist exclusion is what guarantees real rotation across the live set.
+    exclude_recent = bool(recent) and len(fresh_allowed) >= min(4, len(allowed))
+    selection_pool = fresh_allowed if exclude_recent else allowed
+    candidate_count = min(4, len(selection_pool))
+    prompt = (
+        f"Choose {candidate_count} distinct ranked emoji candidates for a conversation topic, "
+        "from best fit to least preferred. Select only from this allowed list: "
+        + json.dumps(selection_pool, ensure_ascii=False)
+        + ". Prefer specific, playful visual metaphors over generic computer, robot, or rocket "
+        "icons when a more distinctive allowed icon fits. Keep every candidate clearly related "
+        "to the topic; novelty must not override meaning. Return only the ranked emoji characters "
+        "separated by spaces, with no words or explanation."
+    )
+    if recent:
+        if exclude_recent:
+            prompt += (
+                " Icons used recently in this chat were removed from the allowed list: "
+                + json.dumps(recent, ensure_ascii=False)
+                + ". Do not return them."
+            )
+        else:
+            prompt += (
+                " These icons were used recently in this chat: "
+                + json.dumps(recent, ensure_ascii=False)
+                + ". Avoid repeating them unless one is unmistakably the best semantic fit."
+            )
+    messages = [
+        {"role": "system", "content": prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Title: {str(title or '')[:120]}\n"
+                f"Opening request: {str(user_message or '')[:500]}"
+            ),
+        },
+    ]
+
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=messages,
+            max_tokens=64,
+            temperature=0.7,
+            timeout=timeout,
+        )
+        content = response.choices[0].message.content or ""
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        choice = strip_think_blocks(None, content).strip().strip("\"'")
+        normalized_choice = _emoji_key(choice)
+
+        # Extract allowed emojis in the model's ranked response order. Matching
+        # the variation-selector-free form accepts e.g. ``⚡`` for allowed
+        # ``⚡️`` while overlap filtering keeps a compound emoji from also
+        # matching one of its component glyphs.
+        hits: list[tuple[int, int, int, str]] = []
+        for allowed_index, emoji in enumerate(selection_pool):
+            key = _emoji_key(emoji)
+            start = normalized_choice.find(key)
+            while start >= 0:
+                hits.append((start, start + len(key), allowed_index, emoji))
+                start = normalized_choice.find(key, start + max(1, len(key)))
+        hits.sort(key=lambda hit: (hit[0], -(hit[1] - hit[0]), hit[2]))
+
+        candidates: list[str] = []
+        occupied: list[tuple[int, int]] = []
+        for start, end, _, emoji in hits:
+            if any(
+                start < used_end and end > used_start
+                for used_start, used_end in occupied
+            ):
+                continue
+            occupied.append((start, end))
+            if emoji not in candidates:
+                candidates.append(emoji)
+        if not candidates:
+            return None
+
+        return next(
+            (emoji for emoji in candidates if _emoji_key(emoji) not in recent_keys),
+            candidates[0],
+        )
+    except Exception:
+        logger.debug("Telegram topic icon selection failed", exc_info=True)
         return None
 
 
@@ -724,9 +969,13 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    # Context vars carry the active Hermes profile and runtime provenance. A
+    # plain daemon thread starts with an empty context and can read the wrong
+    # profile's config or credentials.
+    context = copy_context()
     thread = threading.Thread(
-        target=auto_title_session,
-        args=(session_db, session_id, user_message),
+        target=context.run,
+        args=(auto_title_session, session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,

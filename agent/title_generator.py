@@ -136,16 +136,24 @@ def _title_preferences() -> tuple[int, int, int, dict[str, str]]:
         return defaults[0], defaults[1], defaults[2], {}
 
 
-def _canonical_name_for_message(
-    user_message: str, name_aliases: dict[str, str]
-) -> Optional[str]:
-    """Return the canonical name for the longest whole-term alias match."""
+def _replace_name_aliases(text: str, name_aliases: dict[str, str]) -> str:
+    """Normalize configured whole-term aliases without changing the text's subject.
+
+    Aliases correct names *inside* the opening message or proposed title. A name
+    mentioned anywhere in a long pasted transcript must never replace the whole
+    session title merely because it matched a configured correction.
+    """
+    normalized = str(text or "")
     for alias, canonical in sorted(
         name_aliases.items(), key=lambda item: len(item[0]), reverse=True
     ):
-        if re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", user_message, re.IGNORECASE):
-            return canonical
-    return None
+        normalized = re.sub(
+            rf"(?<!\w){re.escape(alias)}(?!\w)",
+            lambda _match, replacement=canonical: replacement,
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    return normalized
 
 
 def _build_title_prompt(
@@ -168,7 +176,7 @@ def _build_title_prompt(
         word_preference = f"{min_words}-{max_words} words"
     length_rule = (
         f"- Prefer {word_preference} and at most {max_characters} characters; "
-        "use sentence case (capitalize only the first word and proper nouns)."
+        "use sentence case (capitalize only the first word and proper nouns).\n"
     )
     alias_rule = ""
     if name_aliases:
@@ -340,11 +348,13 @@ def generate_title(
     except Exception:  # fail open: a broken validator must not disable titling
         logger.debug("Title runtime validator raised; proceeding", exc_info=True)
     summarized_user_message = _summarize_user_message(user_message)
-    user_snippet = summarized_user_message[:MAX_TITLE_INPUT_CHARS]
-    if not user_snippet.strip():
-        return None
     language = _title_language()
     min_words, max_words, max_characters, name_aliases = _title_preferences()
+    user_snippet = _replace_name_aliases(
+        summarized_user_message[:MAX_TITLE_INPUT_CHARS], name_aliases
+    )
+    if not user_snippet.strip():
+        return None
     prompt = _build_title_prompt(
         language=language,
         min_words=min_words,
@@ -360,20 +370,23 @@ def generate_title(
             max_tokens=64, temperature=0.3, timeout=timeout, main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
-        title = _clean_title(
-            _extract_title_text(response.choices[0].message.content or ""), max_characters
-        )
-        canonical_name = _canonical_name_for_message(summarized_user_message, name_aliases)
-        # Answer-shaped output guard: titling is a 3-7 word task, so a title with many words is a model that
-        # ignored the task and answered the user's message instead ("I don't have context on X — that's not
-        # something I recognize..."). Truncating would store half an assistant blob as the session title,
-        # which is still an assistant blob — reject instead so the caller retries on the next exchange
-        # (maybe_auto_title fires for the first two exchanges). Port of can1357/oh-my-pi#7306.
-        if canonical_name is None and title is not None and len(title.split()) > _MAX_TITLE_WORDS:
-            # Answer-shaped output: reject (not truncate) so the caller retries next exchange.
-            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), _MAX_TITLE_WORDS)
+        content = response.choices[0].message.content or ""
+        extracted_title = _extract_title_text(content)
+        # Check the complete model output before the configured character limit
+        # can truncate an answer-shaped sentence into a plausible short title.
+        if len(extracted_title.split()) > _MAX_TITLE_WORDS:
+            logger.debug(
+                "Rejecting answer-shaped title output (%d words > %d)",
+                len(extracted_title.split()), _MAX_TITLE_WORDS,
+            )
             return None
-        return _enforce_max_words(canonical_name or title, max_words)
+        title = _clean_title(extracted_title, max_characters)
+        # The prompt sees normalized names, and this second boundary catches a
+        # provider that echoes an alias anyway. Canonical replacements may be
+        # longer than the character preference; preserving the configured name
+        # is more important than clipping it.
+        title = _replace_name_aliases(title or "", name_aliases) or None
+        return _enforce_max_words(title, max_words)
     except Exception as e:
         # WARNING so it shows in agent.log without debug mode; stack at debug.
         logger.warning("Title generation failed: %s", e)

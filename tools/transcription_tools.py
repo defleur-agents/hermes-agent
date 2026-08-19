@@ -11,6 +11,7 @@ the dispatcher and the cached local model + idle-unload state; backends live in
 
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -101,6 +102,95 @@ def _load_stt_config() -> dict:
 def is_stt_enabled(stt_config: Optional[dict] = None) -> bool:
     cfg = _load_stt_config() if stt_config is None else stt_config
     return is_truthy_value(cfg.get("enabled", True), default=True)
+
+
+_SPOKEN_TIME_RE = re.compile(
+    r"\b(0?[1-9]|1[0-2])(?::([0-5][0-9]))?\s*([ap])\s*\.?\s*m(?:\.(?=\W|$)|\b)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_spoken_times(text: str) -> str:
+    """Normalize spoken clock forms such as ``09:00 p.m.`` to ``9pm``."""
+
+    def replace(match: re.Match) -> str:
+        hour = str(int(match.group(1)))
+        minutes = match.group(2)
+        suffix = match.group(3).lower() + "m"
+        if not minutes or minutes == "00":
+            return f"{hour}{suffix}"
+        return f"{hour}:{minutes}{suffix}"
+
+    return _SPOKEN_TIME_RE.sub(replace, text)
+
+
+def apply_transcription_postprocess(
+    text: str,
+    stt_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Apply configured deterministic cleanup to a successful transcript.
+
+    ``stt.postprocess.replacements`` is an ordered list of regex rules with
+    ``pattern`` and ``replacement`` fields. Rules are case-insensitive unless
+    ``case_sensitive: true`` is set. Invalid entries are logged and skipped so
+    a typo in an optional cleanup rule cannot discard a valid transcript.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    config = stt_config if isinstance(stt_config, dict) else _load_stt_config()
+    postprocess = config.get("postprocess") or {}
+    if not isinstance(postprocess, dict):
+        return text
+
+    result = text
+    if postprocess.get("normalize_spoken_times") is True:
+        result = _normalize_spoken_times(result)
+
+    replacements = postprocess.get("replacements") or []
+    if not isinstance(replacements, list):
+        logger.warning("Ignoring stt.postprocess.replacements: expected a list")
+        return result
+
+    for index, rule in enumerate(replacements):
+        if not isinstance(rule, dict):
+            logger.warning(
+                "Ignoring stt.postprocess.replacements[%d]: expected a mapping",
+                index,
+            )
+            continue
+        pattern = rule.get("pattern")
+        replacement = rule.get("replacement")
+        if not isinstance(pattern, str) or not isinstance(replacement, str):
+            logger.warning(
+                "Ignoring stt.postprocess.replacements[%d]: pattern and replacement must be strings",
+                index,
+            )
+            continue
+        flags = 0 if rule.get("case_sensitive") is True else re.IGNORECASE
+        try:
+            result = re.sub(pattern, replacement, result, flags=flags)
+        except re.error as exc:
+            logger.warning(
+                "Ignoring invalid stt.postprocess.replacements[%d] regex: %s",
+                index,
+                exc,
+            )
+    return result
+
+
+def _postprocess_transcription_result(
+    result: Dict[str, Any],
+    stt_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a successful transcription envelope with cleanup applied."""
+    if not result.get("success") or not isinstance(result.get("transcript"), str):
+        return result
+    processed = dict(result)
+    processed["transcript"] = apply_transcription_postprocess(
+        result["transcript"], stt_config
+    )
+    return processed
 
 
 def _resolve_stt_language(
@@ -533,8 +623,12 @@ def transcribe_audio(
     if prep_error or prepared_path is None:
         return prep_error or _error_result("Audio preprocessing did not produce a file for transcription.")
     try:
-        return (_validate_audio_file(prepared_path, enforce_size_limit=False)
-                or _transcribe_prepared_audio(prepared_path, model, source))
+        prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
+        if prepared_error:
+            return prepared_error
+        return _postprocess_transcription_result(
+            _transcribe_prepared_audio(prepared_path, model, source)
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
@@ -546,11 +640,14 @@ def transcribe_audio_local_fallback(file_path: str, model: Optional[str] = None)
     error = _validate_audio_file(file_path)
     if error:
         return error
-    local_model = model or (_load_stt_config().get("local") or {}).get("model", DEFAULT_LOCAL_MODEL)
+    stt_config = _load_stt_config()
+    local_model = model or (stt_config.get("local") or {}).get("model", DEFAULT_LOCAL_MODEL)
     if _HAS_FASTER_WHISPER:
-        return _transcribe_local(file_path, _normalize_local_model(local_model))
+        result = _transcribe_local(file_path, _normalize_local_model(local_model))
+        return _postprocess_transcription_result(result, stt_config)
     if _has_local_command():
-        return _transcribe_local_command(file_path, _normalize_local_model(local_model))
+        result = _transcribe_local_command(file_path, _normalize_local_model(local_model))
+        return _postprocess_transcription_result(result, stt_config)
     return _error_result("No installed local STT backend is available.", provider="local")
 
 

@@ -129,7 +129,7 @@ class TestGenerateTitle:
         mock_response.choices[0].message.content = "Investigate the title resolver bug"
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            assert generate_title("question", "answer") == "Investigate the title resolver bug"
+            assert generate_title("question", "answer") == "Investigate the title"
 
 
 
@@ -196,13 +196,15 @@ class TestGenerateTitle:
             patch("hermes_cli.config.load_config_readonly", return_value=config),
             patch("agent.title_generator.call_llm", return_value=response) as llm,
         ):
-            assert generate_title("Update the ATLAS APP") == "ProjectAtlas"
+            assert generate_title("Update the ATLAS APP") == "Planning flow"
 
         prompt = llm.call_args.kwargs["messages"][0]["content"]
+        user_snippet = llm.call_args.kwargs["messages"][1]["content"]
         assert "1-2 words" in prompt
         assert "24 characters" in prompt
         assert '\"project atlas\": \"ProjectAtlas\"' in prompt
         assert '\"atlas app\": \"ProjectAtlas\"' in prompt
+        assert user_snippet == "Update the ProjectAtlas"
 
     def test_invalid_word_range_clamps_minimum_to_maximum(self):
         response = MagicMock()
@@ -246,7 +248,7 @@ class TestGenerateTitle:
     def test_configured_word_maximum_is_enforced_after_alias_handling(self):
         response = MagicMock()
         response.choices = [MagicMock()]
-        response.choices[0].message.content = '{"title": "Atlas rollout"}'
+        response.choices[0].message.content = '{"title": "atlas app rollout"}'
         config = {
             "auxiliary": {
                 "title_generation": {
@@ -288,7 +290,7 @@ class TestGenerateTitle:
     def test_longest_matching_alias_wins(self):
         response = MagicMock()
         response.choices = [MagicMock()]
-        response.choices[0].message.content = '{"title": "Atlas"}'
+        response.choices[0].message.content = '{"title": "atlas app rollout"}'
         config = {
             "auxiliary": {
                 "title_generation": {
@@ -303,12 +305,12 @@ class TestGenerateTitle:
         ):
             title = generate_title("Open the atlas app")
 
-        assert title == "ProjectAtlas"
+        assert title == "ProjectAtlas rollout"
 
     def test_canonical_alias_outranks_character_preference(self):
         response = MagicMock()
         response.choices = [MagicMock()]
-        response.choices[0].message.content = '{"title": "Atlas"}'
+        response.choices[0].message.content = '{"title": "atlas app"}'
         config = {
             "auxiliary": {
                 "title_generation": {
@@ -326,7 +328,7 @@ class TestGenerateTitle:
 
         assert title == "ProjectAtlasLongName"
 
-    def test_name_alias_after_prompt_snippet_is_still_enforced(self):
+    def test_name_alias_after_prompt_snippet_does_not_hijack_title(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = '{"title": "Planning flow"}'
@@ -338,11 +340,42 @@ class TestGenerateTitle:
 
         with (
             patch("hermes_cli.config.load_config_readonly", return_value=config),
-            patch("agent.title_generator.call_llm", return_value=response),
+            patch("agent.title_generator.call_llm", return_value=response) as llm,
         ):
             title = generate_title("x" * 1100 + " atlas app")
 
-        assert title == "ProjectAtlas"
+        assert title == "Planning flow"
+        assert "ProjectAtlas" not in llm.call_args.kwargs["messages"][1]["content"]
+
+    def test_late_transcript_alias_does_not_replace_whole_title(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = (
+            '{"title": "Siegfried handoff recommendations"}'
+        )
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "min_words": 2,
+                    "max_words": 3,
+                    "name_aliases": {"tail net": "Tailnet"},
+                }
+            }
+        }
+        message = (
+            "Analyze the AIWizards handoff with Siegfried and recommend what he should start with. "
+            + "x" * 1100
+            + " Later the transcript mentions the same tail net."
+        )
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response) as llm,
+        ):
+            title = generate_title(message)
+
+        assert title == "Siegfried handoff recommendations"
+        assert "Tailnet" not in llm.call_args.kwargs["messages"][1]["content"]
 
     def test_name_aliases_ignore_hidden_skill_scaffolding(self):
         response = MagicMock()

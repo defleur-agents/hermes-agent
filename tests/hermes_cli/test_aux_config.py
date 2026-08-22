@@ -42,6 +42,10 @@ def test_title_generation_present_in_default_config():
     assert tg["prefer_fast_model"] is False
     assert tg["timeout"] > 0
     assert tg["extra_body"] == {}
+    assert tg["min_words"] == 2
+    assert tg["max_words"] == 3
+    assert tg["max_characters"] == 40
+    assert tg["name_aliases"] == {}
 
 
 

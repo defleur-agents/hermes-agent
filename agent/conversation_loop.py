@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -342,14 +343,65 @@ def _moa_client_consumes_prepared_request(client: Any) -> bool:
     return callable(getattr(completions, "prepare", None))
 
 
-def _join_truncated_parts(parts: List[str]) -> str:
-    """Join continuation fragments, adding a newline where two would glue together (#78577)."""
+_CONTINUATION_RESTART_MIN_CHARS = 200
+_CONTINUATION_RESTART_PREFIX_RATIO = 0.8
+
+
+def _continuation_restarts_previous(previous: str, current: str) -> bool:
+    """True when a continuation regenerated the prior fragment from its start.
+
+    Providers that omit ``finish_reason`` can trigger a recovery prompt after
+    delivering a complete-looking answer. Some models answer that prompt by
+    rewriting the answer instead of continuing it. Only treat the new fragment
+    as a restart when a long prefix covers most of the shorter fragment; short
+    or merely similar continuations remain untouched.
+    """
+    if not isinstance(previous, str) or not isinstance(current, str):
+        return False
+    previous = previous.strip()
+    current = current.strip()
+    shorter = min(len(previous), len(current))
+    if shorter < _CONTINUATION_RESTART_MIN_CHARS:
+        return False
+    required_prefix = max(
+        _CONTINUATION_RESTART_MIN_CHARS,
+        math.ceil(shorter * _CONTINUATION_RESTART_PREFIX_RATIO),
+    )
+    return previous[:required_prefix] == current[:required_prefix]
+
+
+def _concatenate_truncated_parts(parts: List[str]) -> str:
     joined = ""
     for part in parts:
-        if joined and not joined[-1].isspace() and part and not part[0].isspace():
+        if joined and not joined[-1].isspace() and not part[0].isspace():
             joined += "\n"
         joined += part
     return joined
+
+
+def _join_truncated_parts(parts: List[str]) -> str:
+    """Join continuation fragments without duplicating restarted answers."""
+    merged: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        assembled = _concatenate_truncated_parts(merged)
+        if assembled and _continuation_restarts_previous(assembled, part):
+            logger.info(
+                "Continuation fragment restarted the assembled answer; "
+                "replacing the overlapping history before final delivery"
+            )
+            merged = [part]
+        elif merged and _continuation_restarts_previous(merged[-1], part):
+            logger.info(
+                "Continuation fragment restarted the previous answer; "
+                "replacing the overlapping fragment before final delivery"
+            )
+            merged[-1] = part
+        else:
+            merged.append(part)
+
+    return _concatenate_truncated_parts(merged)
 
 
 def _moa_reference_metrics_for_hook(agent: Any) -> Any:

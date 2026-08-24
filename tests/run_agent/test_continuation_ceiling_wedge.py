@@ -62,6 +62,21 @@ def _run(agent, message, history=None):
         return agent.run_conversation(message, conversation_history=history)
 
 
+def _restart_fragments():
+    shared = (
+        "The configuration is already using the current browser execution path. "
+        "Backend discovery resolves the expected executable through the managed bin directory. "
+        "Runtime inspection confirms that the modern command surface is active. "
+        "Compatibility mode remains disabled, so old navigation and click adapters are absent. "
+        "The request therefore travels through the intended client without a fallback route. "
+        "No setting change is required for this part of the setup. "
+        "Version drift can be evaluated separately because it does not alter the active route. "
+    )
+    first = shared + "The first stream ended without a terminal marker."
+    recovered = shared + "The recovered stream completed with a terminal marker."
+    return first, recovered, recovered
+
+
 class TestContinuationCeilingWedge:
     def _exhaust_ceiling(self, agent):
         agent.client.chat.completions.create.side_effect = [
@@ -250,3 +265,64 @@ class TestTruncatedPartJoining:
         assert _join_truncated_parts([]) == ""
         assert _join_truncated_parts(["only"]) == "only"
         assert _join_truncated_parts(["a", "", "b"]) == "a\nb"
+
+    def test_restarted_attempts_are_delivered_once(self, loop_agent):
+        from tests.run_agent.test_run_agent import _mock_response
+
+        first, recovered, final = _restart_fragments()
+        loop_agent.client.chat.completions.create.side_effect = [
+            _stub(first),
+            _stub(recovered),
+            _mock_response(content=final, finish_reason="stop"),
+        ]
+
+        result = _run(loop_agent, "check this setup")
+
+        assert result["completed"] is True
+        assert result["final_response"] == final
+        assert result["final_response"].count(
+            "The configuration is already using the current browser execution path."
+        ) == 1
+        assert loop_agent.client.chat.completions.create.call_count == 3
+
+    def test_restart_of_assembled_history_replaces_all_prior_fragments(self):
+        from agent.conversation_loop import _join_truncated_parts
+
+        first = (
+            "The first section records the route, executable, adapter mode, "
+            "transport selection, and observed runtime state in one coherent block."
+        )
+        second = (
+            "The second section records version drift, upgrade availability, "
+            "compatibility notes, and the operational conclusion."
+        )
+        assembled = _join_truncated_parts([first, second])
+        restarted = assembled + " The regenerated answer now closes cleanly."
+
+        assert _join_truncated_parts([first, second, restarted]) == restarted
+
+    def test_restart_at_retry_ceiling_is_returned_once(self, loop_agent):
+        first, recovered, final = _restart_fragments()
+        loop_agent.client.chat.completions.create.side_effect = [
+            _stub(first),
+            _stub(recovered),
+            _stub(final),
+            _stub(final),
+        ]
+
+        result = _run(loop_agent, "check this setup")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["final_response"].count(
+            "The configuration is already using the current browser execution path."
+        ) == 1
+        assert result["final_response"].count(
+            "The recovered stream completed with a terminal marker."
+        ) == 1
+        assert "truncated after 4 continuation attempts" in (result.get("error") or "")
+
+    def test_short_repeated_fragments_are_not_guessed_away(self):
+        from agent.conversation_loop import _join_truncated_parts
+
+        assert _join_truncated_parts(["echo", "echo"]) == "echo\necho"

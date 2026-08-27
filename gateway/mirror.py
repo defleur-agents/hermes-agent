@@ -65,20 +65,35 @@ def mirror_to_session(
 def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = None, user_id: Optional[str] = None) -> Optional[str]:
     """Active session_id for a platform + chat_id pair.
 
-    state.db is primary; sessions.json is the pre-migration fallback.  DM keys
+    state.db is primary; sessions.json is the pre-migration fallback. DM keys
     don't embed the chat_id ("agent:main:telegram:dm"), so match on the persisted
-    origin.  With *user_id*, exact sender matches win; several same-chat candidates
-    with no user match → None rather than contaminate another participant's session.
+    origin. With *user_id*, exact sender matches win; several same-chat candidates
+    with no user match return None rather than contaminate another participant's
+    session.
 
-    Queries state.db gateway session rows (primary source since #9006); falls back to scanning sessions.json
-    for pre-migration databases.
+    A bare Telegram target has no physical topic/thread. Match only an
+    unthreaded session in that case; treating ``thread_id=None`` as a wildcard
+    used to mirror standalone DM sends into whichever topic happened to be
+    newest, injecting unrelated assistant text into that topic's history.
     """
+    platform_lower = platform.lower()
+    lookup_thread_id = "" if platform_lower == "telegram" and thread_id is None else thread_id
+
     try:
         from hermes_state_registry import acquire, release_or_close
         db = acquire()
         try:
             finder = getattr(db, "find_session_by_origin", None)
-            session_id = finder(platform=platform, chat_id=chat_id, thread_id=thread_id, user_id=user_id) if callable(finder) else None
+            session_id = (
+                finder(
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=lookup_thread_id,
+                    user_id=user_id,
+                )
+                if callable(finder)
+                else None
+            )
             if session_id:
                 return str(session_id)
         finally:
@@ -95,16 +110,25 @@ def _find_session_id(platform: str, chat_id: str, thread_id: Optional[str] = Non
 
     def _matches(entry: dict) -> bool:
         origin = entry.get("origin") or {}
-        return ((origin.get("platform") or entry.get("platform", "")).lower() == platform.lower()
-                and str(origin.get("chat_id", "")) == str(chat_id)
-                and (thread_id is None or str(origin.get("thread_id") or "") == str(thread_id)))
+        return (
+            (origin.get("platform") or entry.get("platform", "")).lower() == platform_lower
+            and str(origin.get("chat_id", "")) == str(chat_id)
+            and (
+                lookup_thread_id is None
+                or str(origin.get("thread_id") or "") == str(lookup_thread_id)
+            )
+        )
 
     # Keys starting with "_" (e.g. the gateway's "_README") are metadata sentinels.
-    candidates = [e for k, e in data.items() if not str(k).startswith("_") and isinstance(e, dict) and _matches(e)]
+    candidates = [
+        entry
+        for key, entry in data.items()
+        if not str(key).startswith("_") and isinstance(entry, dict) and _matches(entry)
+    ]
     if not candidates:
         return None
     if user_id:
-        exact_user_matches = [e for e in candidates if _origin_user_id(e) == str(user_id)]
+        exact_user_matches = [entry for entry in candidates if _origin_user_id(entry) == str(user_id)]
         if exact_user_matches:
             candidates = exact_user_matches
         elif len(candidates) > 1:

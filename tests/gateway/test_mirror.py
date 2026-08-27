@@ -75,6 +75,59 @@ class TestFindSessionId:
 
         assert result == "sess_topic_a"
 
+    def test_bare_telegram_send_never_claims_a_topic_session(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "topic": {
+                "session_id": "sess_topic",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "12345",
+                    "thread_id": "42",
+                },
+                "updated_at": "2026-02-01T00:00:00",
+            },
+            "general": {
+                "session_id": "sess_general",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-01-01T00:00:00",
+            },
+        })
+
+        with patch("hermes_state.SessionDB") as session_db_cls, \
+             patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            session_db_cls.return_value.find_session_by_origin.return_value = None
+            result = _find_session_id("telegram", "12345")
+
+        assert result == "sess_general"
+        session_db_cls.return_value.find_session_by_origin.assert_called_once_with(
+            platform="telegram",
+            chat_id="12345",
+            thread_id="",
+            user_id=None,
+        )
+
+    def test_bare_telegram_send_with_only_topics_fails_closed(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "topic": {
+                "session_id": "sess_topic",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "12345",
+                    "thread_id": "42",
+                },
+                "updated_at": "2026-02-01T00:00:00",
+            },
+        })
+
+        with patch("hermes_state.SessionDB") as session_db_cls, \
+             patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            session_db_cls.return_value.find_session_by_origin.return_value = None
+            result = _find_session_id("telegram", "12345")
+
+        assert result is None
+
 
 class TestMirrorToSession:
 

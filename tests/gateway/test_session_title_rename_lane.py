@@ -27,7 +27,7 @@ def _attach(lane):
         _is_discord_auto_thread_lane=lambda src: lane == "discord",
         _is_relay_discord_channel_lane=lambda src: False,
         _schedule_telegram_topic_title_rename=(
-            lambda src, sid, title: renames.append(title)
+            lambda src, sid, title, **kwargs: renames.append(title)
         ),
         _schedule_discord_semantic_thread_rename=(
             lambda src, sid, title: renames.append(title)
@@ -53,3 +53,31 @@ def test_the_rename_waits_for_the_model_title(lane):
 
     callback("Fix flaky auth test", "llm")
     assert renames == ["Fix flaky auth test"]
+
+
+def test_telegram_callback_forwards_opening_message_to_icon_selector():
+    calls = []
+    source = types.SimpleNamespace(platform=Platform.TELEGRAM, chat_id="chat-1")
+    runner = types.SimpleNamespace(
+        _is_telegram_topic_lane=lambda src: True,
+        _is_discord_auto_thread_lane=lambda src: False,
+        _is_relay_discord_channel_lane=lambda src: False,
+        _schedule_telegram_topic_title_rename=(
+            lambda src, sid, title, **kwargs: calls.append((title, kwargs))
+        ),
+        _schedule_discord_semantic_thread_rename=lambda *args, **kwargs: None,
+    )
+    holder = types.SimpleNamespace(
+        _runner=runner,
+        _attach_session_title_callback=TurnRunner._attach_session_title_callback,
+    )
+    agent = types.SimpleNamespace(session_id="sess-1")
+    holder._attach_session_title_callback(
+        holder,
+        agent,
+        types.SimpleNamespace(source=source, message="Build a lunar calendar"),
+    )
+
+    agent._on_session_title("Lunar calendar", "llm")
+
+    assert calls == [("Lunar calendar", {"user_message": "Build a lunar calendar"})]

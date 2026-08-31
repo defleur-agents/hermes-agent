@@ -110,6 +110,10 @@ class ToolSearchConfig:
     # Absolute cap on the embedded listing, regardless of context size.
     # Effective budget = min(listing_max_tokens, threshold_pct% of context).
     listing_max_tokens: int = 4000
+    # Small, operator-selected plugin tools that must remain directly callable
+    # even when progressive disclosure defers the rest of the plugin/MCP
+    # catalog. Names still pass normal toolset and check_fn gates.
+    eager_tools: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -158,6 +162,17 @@ class ToolSearchConfig:
         else:
             listing = "auto"
         listing_max_tokens = max(200, min(60000, _safe_int(raw.get("listing_max_tokens"), 4000)))
+        eager_raw = raw.get("eager_tools", [])
+        if isinstance(eager_raw, str):
+            eager_raw = [eager_raw]
+        if not isinstance(eager_raw, (list, tuple, set)):
+            eager_raw = []
+        eager_tools = frozenset(
+            name
+            for value in eager_raw
+            if (name := str(value or "").strip())
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", name)
+        )
 
         return cls(
             enabled=enabled,
@@ -166,6 +181,7 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=listing,
             listing_max_tokens=listing_max_tokens,
+            eager_tools=eager_tools,
         )
 
 
@@ -234,16 +250,22 @@ def _core_tool_names() -> frozenset[str]:
 _DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
 
 
-def is_deferrable_tool_name(name: str) -> bool:
+def is_deferrable_tool_name(
+    name: str,
+    eager_tools: Optional[Iterable[str]] = None,
+) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
     OR it is neither in ``_HERMES_CORE_TOOLS`` nor a session-gated GUI
-    surface toolset. Core and direct surface tools are never deferred even
-    when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    surface toolset. Core, operator-pinned eager tools, and direct surface
+    tools are never deferred even when their toolset is plugin-provided.
     """
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    if eager_tools is None:
+        eager_tools = load_config_readonly().eager_tools
+    if name in frozenset(eager_tools):
         return False
     if name in _core_tool_names():
         return False
@@ -265,6 +287,7 @@ def is_deferrable_tool_name(name: str) -> bool:
 
 def _describe_classification(
     name: str,
+    eager_tools: Optional[Iterable[str]] = None,
 ) -> Literal["available", "not_found", "not_deferrable"]:
     """Classify a describe name without treating unknown names as errors."""
     try:
@@ -274,24 +297,36 @@ def _describe_classification(
         return "not_found"
     if entry is None:
         return "not_found"
+    resolved_eager = frozenset(
+        eager_tools if eager_tools is not None else load_config_readonly().eager_tools
+    )
     if (
         name in BRIDGE_TOOL_NAMES
         or name in _core_tool_names()
+        or name in resolved_eager
         or entry.toolset in _DIRECT_SURFACE_TOOLSETS
     ):
         return "not_deferrable"
     return "available"
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    eager_tools: Optional[Iterable[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
-    every core tool, every session-gated GUI surface tool, plus any tool we
-    can't classify. ``deferrable`` is the candidate set for catalog entry.
+    every core tool, every operator-pinned eager tool, every session-gated GUI
+    surface tool, plus any tool we can't classify. ``deferrable`` is the
+    candidate set for catalog entry.
     """
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
+    resolved_eager = frozenset(
+        eager_tools if eager_tools is not None else load_config_readonly().eager_tools
+    )
     for td in tool_defs:
         fn = td.get("function") or {}
         name = fn.get("name", "")
@@ -299,7 +334,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if is_deferrable_tool_name(name, resolved_eager):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -927,7 +962,7 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(incoming, eager_tools=config.eager_tools)
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -1078,7 +1113,7 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, eager_tools=config.eager_tools)
     catalog = build_catalog(deferrable)
 
     results: List[Dict[str, Any]] = []
@@ -1151,7 +1186,7 @@ def dispatch_tool_describe(args: Dict[str, Any],
             "Retry with fewer names per call."
         )
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools(current_tool_defs, eager_tools=config.eager_tools)
     by_name: Dict[str, Dict[str, Any]] = {}
     for td in deferrable:
         fn = td.get("function") or {}
@@ -1168,7 +1203,7 @@ def dispatch_tool_describe(args: Dict[str, Any],
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
             }
-        elif _describe_classification(name) == "not_deferrable":
+        elif _describe_classification(name, config.eager_tools) == "not_deferrable":
             errors[name] = (
                 f"'{name}' is not a deferrable tool. If you see it in the tools list "
                 "already, call it directly; otherwise check the spelling against tool_search."
@@ -1197,10 +1232,11 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
     an out-of-scope tool via the bridge.
     """
+    eager_tools = load_config_readonly().eager_tools
     names: set[str] = set()
     for td in tool_defs:
         name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
+        if name and is_deferrable_tool_name(name, eager_tools):
             names.add(name)
     return frozenset(names)
 

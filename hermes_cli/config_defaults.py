@@ -3071,6 +3071,9 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
+            # Exact plugin/MCP tool names that remain directly callable while
+            # the rest of the external catalog stays progressively disclosed.
+            "eager_tools": [],
         },
     },
 

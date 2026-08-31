@@ -103,6 +103,7 @@ tools:
     max_search_limit: 25
     listing: auto       # embed a grouped name+description catalog manifest
     listing_max_tokens: 4000
+    eager_tools: []     # exact plugin/MCP tool names kept directly callable
 ```
 
 | Key | Default | Meaning |
@@ -113,6 +114,7 @@ tools:
 | `max_search_limit` | `25` | Hard upper bound the model can request via `limit` (per query). Range 1–50. |
 | `listing` | `auto` | Embed a skills-style manifest of every deferred tool (name + first sentence of its description, ≤60 chars, grouped by MCP server) in the `tool_search` bridge description. `auto` includes it when it fits the budget (falling back to names-only, then to the tier-2 server summary); `on`/`off` force either way. |
 | `listing_max_tokens` | `4000` | Absolute cap on the embedded listing, regardless of context size. Range 200–60000. Large catalogs degrade to names-only or per-server summaries, keeping full schemas available through search. |
+| `eager_tools` | `[]` | Exact plugin/MCP tool names kept directly callable while the rest of the catalog remains deferred. Normal toolset, availability, and permission gates still apply. |
 
 Per-call array caps are internal safety bounds, not configuration. Over-cap
 calls return an error so the model can retry with a smaller batch.

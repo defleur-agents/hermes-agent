@@ -88,7 +88,7 @@ def test_safe_restore_fallback_refuses_under_own_live_connection(live_held_db):
 
     # The held generation must survive: same WAL inode, no deleted-fd ghosts.
     assert wal.exists() and wal.stat().st_ino == wal_ino
-    assert _own_deleted_fds(str(dst.name)) == []
+    assert _own_deleted_fds(str(dst)) == []
 
 
 def test_update_autorestore_refuses_under_own_live_connection(
@@ -103,7 +103,7 @@ def test_update_autorestore_refuses_under_own_live_connection(
     out = capsys.readouterr().out
     assert "Auto-restore refused" in out
     assert wal.exists() and wal.stat().st_ino == wal_ino
-    assert _own_deleted_fds(str(dst.name)) == []
+    assert _own_deleted_fds(str(dst)) == []
 
 
 def test_safe_restore_fallback_still_works_without_holder(tmp_path):

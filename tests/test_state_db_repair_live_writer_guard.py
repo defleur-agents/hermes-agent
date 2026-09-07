@@ -19,6 +19,7 @@ live-writer guard.)
 from __future__ import annotations
 
 import errno
+import os
 import select
 import sqlite3
 import subprocess
@@ -118,6 +119,36 @@ def test_linux_holder_scan_does_not_require_psutil(tmp_path, monkeypatch):
     )
 
     assert holders == []
+
+
+@pytest.mark.linux_only
+def test_uninspectable_foreign_hermes_process_fenced_by_private_path_is_ignored(
+    tmp_path, monkeypatch
+):
+    """A different uid behind hidepid is not a holder of a private database."""
+    db = tmp_path / "state.db"
+    db.touch(mode=0o600)
+
+    def _listdir(path):
+        if path == "/proc":
+            return ["4242"]
+        if path == "/proc/4242/fd":
+            raise PermissionError(errno.EACCES, "hidepid", path)
+        raise AssertionError(f"unexpected scan path: {path}")
+
+    monkeypatch.setattr(hermes_state_holders.os, "listdir", _listdir)
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "_read_proc_argv",
+        lambda _pid: ["python3", "-m", "hermes_cli.main", "gateway"],
+    )
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "_read_proc_credentials",
+        lambda _pid: (os.geteuid() + 1000, {os.getegid() + 1000}),
+    )
+
+    assert hermes_state_holders.foreign_state_db_holders(db) == []
 
 
 @pytest.mark.linux_only

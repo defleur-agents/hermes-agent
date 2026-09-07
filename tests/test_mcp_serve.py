@@ -1366,6 +1366,7 @@ class TestEventBridgePollE2E:
 
         bridge = mcp_serve.EventBridge()
         bridge._establish_baseline()
+        baseline_mtime_ns = db_path.stat().st_mtime_ns
         # Messages that existed before start() are not replayed.
         assert bridge.poll_events(after_cursor=0)["events"] == []
 
@@ -1374,7 +1375,10 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        # Explicitly advance mtime: os.utime(..., None) can reuse the same
+        # coarse filesystem clock tick and make this deterministic fixture lie.
+        bumped_mtime_ns = baseline_mtime_ns + 1_000_000_000
+        os.utime(db_path, ns=(bumped_mtime_ns, bumped_mtime_ns))
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1400,6 +1404,7 @@ class TestEventBridgePollE2E:
 
         bridge = mcp_serve.EventBridge()
         bridge._establish_baseline()  # no conversations exist yet
+        baseline_mtime_ns = db_path.stat().st_mtime_ns
 
         # The gateway registers a brand-new conversation + its first message.
         sid = "20260329_150000_fresh"
@@ -1412,7 +1417,8 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        bumped_mtime_ns = baseline_mtime_ns + 1_000_000_000
+        os.utime(db_path, ns=(bumped_mtime_ns, bumped_mtime_ns))
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

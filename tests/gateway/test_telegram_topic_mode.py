@@ -1254,7 +1254,8 @@ async def test_auto_topic_icon_history_keeps_only_twelve_recent_unique_choices()
             )
             assert selected_id == f"icon-{index}"
 
-    assert runner._telegram_topic_icon_history["208214988"] == emojis[-12:]
+    history_key = runner._telegram_topic_icon_history_key(source, adapter)
+    assert runner._telegram_topic_icon_history[history_key] == emojis[-12:]
     assert choose.call_args_list[-1].kwargs["recent_emojis"] == emojis[1:13]
 
 

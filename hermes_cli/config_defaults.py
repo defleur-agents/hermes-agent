@@ -1262,6 +1262,13 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
+            # Compact title preferences. The range guides the model; max_words
+            # and the character budget are enforced after generation.
+            "min_words": 2,
+            "max_words": 3,
+            "max_characters": 40,
+            # Case-insensitive aliases mapped to canonical display names.
+            "name_aliases": {},
         },
         "memory_query_rewrite": {
             "provider": "auto",
@@ -3071,6 +3078,9 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
+            # Exact plugin/MCP tool names that remain directly callable while
+            # the rest of the external catalog stays progressively disclosed.
+            "eager_tools": [],
         },
     },
 

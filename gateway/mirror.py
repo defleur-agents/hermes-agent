@@ -129,7 +129,17 @@ def _find_session_id(
     When *user_id* is provided, prefer exact sender matches. If multiple
     same-chat candidates exist and none matches the user, return None instead
     of guessing and contaminating another participant's session.
+
+    A bare Telegram target has no physical topic/thread. Match only an
+    unthreaded session in that case; treating ``thread_id=None`` as a wildcard
+    used to mirror standalone DM sends into whichever topic happened to be
+    newest, injecting unrelated assistant text into that topic's history.
     """
+    platform_lower = platform.lower()
+    lookup_thread_id = (
+        "" if platform_lower == "telegram" and thread_id is None else thread_id
+    )
+
     # Primary: state.db
     try:
         from hermes_state import get_shared_session_db
@@ -140,7 +150,7 @@ def _find_session_id(
                 session_id = finder(
                     platform=platform,
                     chat_id=chat_id,
-                    thread_id=thread_id,
+                    thread_id=lookup_thread_id,
                     user_id=user_id,
                 )
                 if session_id:
@@ -161,7 +171,6 @@ def _find_session_id(
     except Exception:
         return None
 
-    platform_lower = platform.lower()
     candidates = []
 
     for _key, entry in data.items():
@@ -178,7 +187,10 @@ def _find_session_id(
         origin_chat_id = str(origin.get("chat_id", ""))
         if origin_chat_id == str(chat_id):
             origin_thread_id = origin.get("thread_id")
-            if thread_id is not None and str(origin_thread_id or "") != str(thread_id):
+            if (
+                lookup_thread_id is not None
+                and str(origin_thread_id or "") != str(lookup_thread_id)
+            ):
                 continue
             candidates.append(entry)
 

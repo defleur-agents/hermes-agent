@@ -11,6 +11,7 @@ import errno
 import logging
 import os
 import sqlite3
+import stat
 import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
@@ -125,6 +126,94 @@ def canonical_sqlite_path(path: str) -> str:
     return os.path.normcase(os.path.abspath(path.removesuffix(" (deleted)")))
 
 
+def _read_proc_credentials(pid: int) -> Optional[Tuple[int, Set[int]]]:
+    """Return a Linux process's effective uid and supplementary groups."""
+    try:
+        uid: Optional[int] = None
+        groups: Set[int] = set()
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("Uid:"):
+                    values = line.split()[1:]
+                    if len(values) >= 2:
+                        uid = int(values[1])
+                elif line.startswith("Groups:"):
+                    groups = {int(value) for value in line.split()[1:]}
+        return (uid, groups) if uid is not None else None
+    except (OSError, ValueError):
+        return None
+
+
+def _mode_allows(
+    mode: int,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+    process_uid: int,
+    process_groups: Set[int],
+    directory: bool,
+) -> bool:
+    """Evaluate ordinary POSIX access bits for a foreign process identity."""
+    if process_uid == owner_uid:
+        bits = (mode >> 6) & 0b111
+    elif owner_gid in process_groups:
+        bits = (mode >> 3) & 0b111
+    else:
+        bits = mode & 0b111
+    required = 0b001 if directory else 0b110
+    return bool(bits & required)
+
+
+def _process_may_access_watched_paths(pid: int, paths: Sequence[str]) -> bool:
+    """Fail closed unless a different uid is fenced by current path permissions.
+
+    On ``hidepid`` hosts another user's ``/proc/<pid>/fd`` can be unreadable.
+    Treating that process as a holder of every database on the machine makes
+    structural maintenance impossible.  A foreign non-root uid can be ignored
+    only when an ordinary POSIX permission check proves it cannot traverse or
+    open any existing watched path.  Same-uid, root, ACL-bearing, and otherwise
+    unprovable cases still block.
+    """
+    credentials = _read_proc_credentials(pid)
+    if credentials is None:
+        return True
+    process_uid, process_groups = credentials
+    if process_uid in (0, os.geteuid()):
+        return True
+
+    for raw_path in paths:
+        path = Path(raw_path)
+        try:
+            path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+
+        chain = [*reversed(path.parents), path]
+        accessible = True
+        for node in chain:
+            try:
+                node_stat = node.stat()
+                if hasattr(os, "listxattr") and "system.posix_acl_access" in os.listxattr(node):
+                    return True
+            except OSError:
+                return True
+            if not _mode_allows(
+                node_stat.st_mode,
+                owner_uid=node_stat.st_uid,
+                owner_gid=node_stat.st_gid,
+                process_uid=process_uid,
+                process_groups=process_groups,
+                directory=stat.S_ISDIR(node_stat.st_mode),
+            ):
+                accessible = False
+                break
+        if accessible:
+            return True
+    return False
+
+
 def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
     """Return foreign holders of the DB or one of its WAL sidecars.
 
@@ -171,7 +260,11 @@ def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
                     fds = os.listdir(fd_dir)
                 except OSError:
                     argv = _read_proc_argv(pid)
-                    if argv is not None and _looks_like_hermes(argv):
+                    if (
+                        argv is not None
+                        and _looks_like_hermes(argv)
+                        and _process_may_access_watched_paths(pid, tuple(watched))
+                    ):
                         cmdline = " ".join(argv)
                         holders.append((pid, f"uninspectable holder: {cmdline[:80]}"))
                     continue
@@ -183,7 +276,11 @@ def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
                         if exc.errno in (errno.ENOENT, errno.ESRCH):
                             continue
                         argv = _read_proc_argv(pid)
-                        if argv is not None and _looks_like_hermes(argv):
+                        if (
+                            argv is not None
+                            and _looks_like_hermes(argv)
+                            and _process_may_access_watched_paths(pid, tuple(watched))
+                        ):
                             holders.append(
                                 (
                                     pid,
@@ -203,7 +300,11 @@ def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
                             )
                         else:
                             argv = _read_proc_argv(pid)
-                            if argv is not None and _looks_like_hermes(argv):
+                            if (
+                                argv is not None
+                                and _looks_like_hermes(argv)
+                                and _process_may_access_watched_paths(pid, tuple(watched))
+                            ):
                                 holders.append(
                                     (
                                         pid,

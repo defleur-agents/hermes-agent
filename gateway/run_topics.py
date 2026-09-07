@@ -525,6 +525,11 @@ class GatewayTopicThreadsMixin:
         """``gateway.platforms.telegram.extra.disable_topic_auto_rename``; default False (auto-rename on)."""
         return is_truthy_value(self._telegram_topic_extra(source).get("disable_topic_auto_rename"))
 
+    def _telegram_topic_icon_history_key(self, source: SessionSource, adapter) -> str:
+        """Process-local icon state key, isolated by routed profile and transport owner."""
+        profile_name = self._telegram_topic_profile_name(source)
+        return f"{profile_name}:{id(adapter):x}:{str(source.chat_id or '')}"
+
     async def _select_telegram_topic_icon_id(
         self,
         adapter,
@@ -532,8 +537,8 @@ class GatewayTopicThreadsMixin:
         title: str,
         user_message: str,
     ) -> Optional[str]:
-        """Serialize icon selection per chat so recent-history rotation is race-free."""
-        history_key = str(source.chat_id)
+        """Serialize icon selection per profile/transport/chat so recent-history rotation is race-free."""
+        history_key = self._telegram_topic_icon_history_key(source, adapter)
         lock_store = getattr(self, "_telegram_topic_icon_locks", None)
         if not isinstance(lock_store, OrderedDict):
             lock_store = OrderedDict()
@@ -640,7 +645,7 @@ class GatewayTopicThreadsMixin:
                 history_store.items() if isinstance(history_store, dict) else ()
             )
             self._telegram_topic_icon_history = history_store
-        history_key = str(source.chat_id)
+        history_key = self._telegram_topic_icon_history_key(source, adapter)
         if history_key in history_store:
             history_store.move_to_end(history_key)
         recent_icons = [

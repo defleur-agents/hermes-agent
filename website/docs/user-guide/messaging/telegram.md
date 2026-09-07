@@ -824,7 +824,7 @@ auxiliary:
       atlas app: ProjectAtlas
 ```
 
-`min_words` and `max_words` guide the model toward a compact range. Hermes also enforces `max_words` after generation, so an overlong model response cannot escape the configured display policy. `name_aliases` is case-insensitive and keeps personal project vocabulary in user config rather than Hermes source code. When an alias appears in the opening message, Hermes deterministically uses its configured canonical name even if the title model returns something else; explicit canonical names take precedence over the generic character preference.
+`min_words` and `max_words` guide the model toward a compact range. Hermes also enforces `max_words` after generation, so an overlong model response cannot escape the configured display policy. `name_aliases` is case-insensitive and replaces whole title-relevant terms with their configured canonical spelling. An alias does not force the entire title merely because it appears somewhere in the opening message; ordinary context can remain around it. When the final title is exactly an applied canonical display name, that explicit name may exceed the generic `max_characters` preference.
 
 Telegram can also choose a semantically matching **full-size topic icon** instead of leaving the default colored bubble. This is opt-in because it makes one additional lightweight title-generation call when a new topic is named:
 
@@ -839,7 +839,7 @@ gateway:
           ProjectAtlas: "🔭"
 ```
 
-Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to four semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 12 most recent selections per chat out of the next model candidate pool whenever at least four fresh options remain, then falls back to ranked non-recent selection for smaller live sets. This bounded diversity history is process-local and resets when the gateway restarts.
+Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to four semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 12 most recent selections per routed profile, transport owner, and chat out of the next model candidate pool whenever at least four fresh options remain, then falls back to ranked non-recent selection for smaller live sets. This bounded diversity history is process-local and resets when the gateway restarts.
 
 `topic_icon_overrides` is optional and uses ordinary emoji characters as portable selectors rather than hard-coded Telegram IDs. An exact override always wins, which is useful when a recurring project should keep a recognizable signature icon.
 

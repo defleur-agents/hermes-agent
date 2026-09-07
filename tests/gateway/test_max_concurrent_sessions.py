@@ -31,20 +31,25 @@ class _FakeAdapter:
             event.set()
 
 
-def _make_source(chat_id: str = "chat-1") -> SessionSource:
+def _make_source(chat_id: str = "chat-1", thread_id: str | None = None) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
         chat_id=chat_id,
         chat_type="dm",
         user_id=f"user-{chat_id}",
+        thread_id=thread_id,
     )
 
 
-def _make_event(text: str = "hello", chat_id: str = "chat-1") -> MessageEvent:
+def _make_event(
+    text: str = "hello",
+    chat_id: str = "chat-1",
+    thread_id: str | None = None,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
-        source=_make_source(chat_id),
+        source=_make_source(chat_id, thread_id),
     )
 
 
@@ -130,5 +135,35 @@ def test_status_command_bypasses_active_session_limit(monkeypatch):
 
     assert result == "status ok"
     runner._handle_status_command.assert_awaited_once()
+
+
+def test_default_unlimited_allows_same_chat_topics_to_run_concurrently(monkeypatch):
+    _silence_global_gateway_hooks(monkeypatch)
+    runner = _make_runner(max_concurrent_sessions=None)
+    entered: set[str] = set()
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_agent(self_inner, event, source, session_key, generation):
+        entered.add(str(source.thread_id))
+        if entered == {"101", "202"}:
+            both_entered.set()
+        await release.wait()
+
+    async def scenario():
+        with patch.object(GatewayRunner, "_handle_message_with_agent", hold_agent):
+            first = asyncio.create_task(
+                runner._handle_message(_make_event(chat_id="same-chat", thread_id="101"))
+            )
+            second = asyncio.create_task(
+                runner._handle_message(_make_event(chat_id="same-chat", thread_id="202"))
+            )
+            await asyncio.wait_for(both_entered.wait(), timeout=1)
+            release.set()
+            await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+
+    assert entered == {"101", "202"}
 
 

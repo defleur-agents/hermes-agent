@@ -117,6 +117,40 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
 
 
 @pytest.mark.asyncio
+async def test_session_messages_can_page_compacted_display_history(adapter, session_db):
+    session_id = session_db.create_session("compacted-messages", "api_server")
+    session_db.append_messages_batch(session_id, [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ])
+    session_db.archive_and_compact(session_id, [
+        {"role": "assistant", "content": "summary"},
+        {"role": "user", "content": "live question"},
+        {"role": "assistant", "content": "live answer"},
+    ])
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        default_resp = await cli.get(f"/api/sessions/{session_id}/messages?order=oldest")
+        default_payload = await default_resp.json()
+        complete_resp = await cli.get(
+            f"/api/sessions/{session_id}/messages?order=oldest&include_compacted=true"
+        )
+        complete_payload = await complete_resp.json()
+        invalid_resp = await cli.get(
+            f"/api/sessions/{session_id}/messages?include_compacted=sometimes"
+        )
+
+    assert [message["content"] for message in default_payload["data"]] == [
+        "summary", "live question", "live answer",
+    ]
+    assert [message["content"] for message in complete_payload["data"]] == [
+        "old question", "old answer", "summary", "live question", "live answer",
+    ]
+    assert invalid_resp.status == 400
+
+
+@pytest.mark.asyncio
 async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):
     """API-server request sessions should reach tools and terminal subprocess env."""
     monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")

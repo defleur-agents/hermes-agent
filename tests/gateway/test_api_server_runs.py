@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -389,6 +390,101 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_interim_commentary_precedes_tool_event_and_keeps_reasoning_separate(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        secret = "sk-" + "a" * 32
+
+        def _create_agent(**callbacks):
+            agent = MagicMock()
+
+            def _run(*_args, **_kwargs):
+                callbacks["interim_assistant_callback"](
+                    f"I'll inspect the repository first. {secret}", already_streamed=True)
+                callbacks["tool_progress_callback"](
+                    "reasoning.available", "_thinking", "private scratchpad")
+                callbacks["tool_progress_callback"](
+                    "tool.started", "terminal", "Inspecting repository")
+                callbacks["stream_delta_callback"]("Done.")
+                return {"final_response": "Done."}
+
+            agent.run_conversation.side_effect = _run
+            agent.session_id = "runs-interim-session"
+            agent.session_prompt_tokens = 10
+            agent.session_completion_tokens = 5
+            agent.session_total_tokens = 15
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                start = await cli.post("/v1/runs", json={"input": "inspect"})
+                assert start.status == 202
+                run_id = (await start.json())["run_id"]
+                stream = await cli.get(f"/v1/runs/{run_id}/events")
+                events = [
+                    json.loads(line.removeprefix("data: "))
+                    for line in (await stream.text()).splitlines()
+                    if line.startswith("data: ")
+                ]
+
+        event_names = [event["event"] for event in events]
+        assert event_names.index("message.interim") < event_names.index("tool.started")
+        interim = [event for event in events if event["event"] == "message.interim"]
+        assert len(interim) == 1
+        assert interim[0]["text"].startswith("I'll inspect the repository first.")
+        assert secret not in interim[0]["text"]
+        assert interim[0]["already_streamed"] is True
+        reasoning = [event for event in events if event["event"] == "reasoning.available"]
+        assert len(reasoning) == 1
+        assert reasoning[0]["text"] == "private scratchpad"
+        assert "private scratchpad" not in {event["text"] for event in interim}
+        deltas = [event for event in events if event["event"] == "message.delta"]
+        assert len(deltas) == 1
+        assert deltas[0]["delta"] == "Done."
+
+    @pytest.mark.asyncio
+    async def test_agent_without_interim_emission_keeps_reasoning_separate(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        def _create_agent(**callbacks):
+            captured.update(callbacks)
+            agent = MagicMock()
+
+            def _run(*_args, **_kwargs):
+                callbacks["tool_progress_callback"](
+                    "reasoning.available", "_thinking", "hidden reasoning")
+                return {"final_response": "Done."}
+
+            agent.run_conversation.side_effect = _run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+                start = await cli.post("/v1/runs", json={"input": "inspect"})
+                run_id = (await start.json())["run_id"]
+                stream = await cli.get(f"/v1/runs/{run_id}/events")
+                events = [
+                    json.loads(line.removeprefix("data: "))
+                    for line in (await stream.text()).splitlines()
+                    if line.startswith("data: ")
+                ]
+
+        assert callable(captured["interim_assistant_callback"])
+        assert "message.interim" not in {event["event"] for event in events}
+        assert any(
+            event["event"] == "reasoning.available"
+            and event["text"] == "hidden reasoning"
+            for event in events
+        )
 
 
     @pytest.mark.asyncio

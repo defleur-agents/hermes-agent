@@ -358,6 +358,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             item_id = str(item.get("id") or "")
             phase = str(item.get("phase") or (message_phases.get(item_id) if item_id else "") or "")
             if completed:
+                if phase and not item.get("phase"):
+                    # The projector runs immediately after this callback. Carry
+                    # forward a known item/started phase when Codex omits it on
+                    # item/completed so final/history classification stays safe.
+                    item["phase"] = phase
                 _fire_agent_message_completed(item, phase)
                 if item_id:
                     message_phases.pop(item_id, None)
@@ -371,7 +376,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     }
 
     def on_event(note: dict) -> None:
-        handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
+        method = (note.get("method") or "") if isinstance(note, dict) else ""
+        if method in {"turn/started", "turn/completed"}:
+            message_phases.clear()
+        handler = handlers.get(method)
         if handler is not None:
             params = note.get("params")
             handler(params if isinstance(params, dict) else {})

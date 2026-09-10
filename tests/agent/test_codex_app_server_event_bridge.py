@@ -199,6 +199,28 @@ class TestStreamDeltaDispatch:
         agent._fire_stream_delta.assert_not_called()
         agent._emit_interim_assistant_message.assert_not_called()
 
+    def test_turn_boundary_clears_stale_message_phase(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage", "id": "reused", "phase": "final_answer",
+        }))
+        bridge({"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}})
+        bridge({"method": "item/agentMessage/delta",
+                "params": {"itemId": "reused", "delta": "late or reused text"}})
+        agent._fire_stream_delta.assert_not_called()
+
+    def test_completed_message_inherits_known_started_phase_for_projector(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage", "id": "final-known", "phase": "final_answer",
+        }))
+        notification = _item_completed({
+            "type": "agentMessage", "id": "final-known", "text": "Done.",
+        })
+        bridge(notification)
+        assert notification["params"]["item"]["phase"] == "final_answer"
 
 
     def test_reasoning_delta_fires_reasoning_callback(self):

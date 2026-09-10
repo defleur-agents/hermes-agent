@@ -191,7 +191,7 @@ class TestRunTurn:
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "hello world"},
+            item={"type": "agentMessage", "id": "m1", "phase": "final_answer", "text": "hello world"},
             threadId="t", turnId="tu1",
         )
         client.queue_notification(
@@ -209,6 +209,36 @@ class TestRunTurn:
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
 
+    def test_commentary_is_history_only_and_final_answer_stays_canonical(self):
+        client = FakeClient()
+        client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage", "id": "comment-1", "phase": "commentary",
+                "text": "Checking the relevant implementation.",
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage", "id": "final-1", "phase": "final_answer",
+                "text": "The change is verified.",
+            },
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        result = make_session(client).run_turn("inspect", turn_timeout=2.0)
+        assert result.final_text == "The change is verified."
+        assert [
+            message.get("content") for message in result.projected_messages
+            if message.get("role") == "assistant"
+        ] == ["Checking the relevant implementation.", "The change is verified."]
 
 
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
@@ -227,6 +257,7 @@ class TestRunTurn:
             item={
                 "type": "agentMessage",
                 "id": "child-message",
+                "phase": "final_answer",
                 "text": "child drain summary",
             },
         )
@@ -251,6 +282,7 @@ class TestRunTurn:
                 item={
                     "type": "agentMessage",
                     "id": "parent-message",
+                    "phase": "final_answer",
                     "text": "parent after approval",
                 },
             )
@@ -296,7 +328,7 @@ class TestRunTurn:
             )
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            item={"type": "agentMessage", "id": "m1", "phase": "final_answer", "text": "done"},
             threadId="t", turnId="tu1",
         )
         client.queue_notification(
@@ -409,7 +441,7 @@ class TestCompactThread:
             "item/completed",
             threadId="thread-fake-001",
             turnId="compact-turn-1",
-            item={"type": "agentMessage", "id": "m1", "text": "compacted"},
+            item={"type": "agentMessage", "id": "m1", "phase": "final_answer", "text": "compacted"},
         )
         client.queue_notification(
             "thread/tokenUsage/updated",
@@ -452,6 +484,7 @@ class TestCompactThread:
             item={
                 "type": "agentMessage",
                 "id": "child-compact-message",
+                "phase": "final_answer",
                 "text": "child compact summary",
             },
         )
@@ -476,6 +509,7 @@ class TestCompactThread:
             item={
                 "type": "agentMessage",
                 "id": "parent-compact-message",
+                "phase": "final_answer",
                 "text": "parent compacted",
             },
         )
@@ -711,7 +745,7 @@ class TestSessionRetirement:
         client = FakeClient()
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            item={"type": "agentMessage", "id": "m1", "phase": "final_answer", "text": "done"},
             threadId="t",
             turnId="tu1",
         )
@@ -778,7 +812,7 @@ class TestSessionRetirement:
         # Non-tool activity immediately after — resets watchdog.
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "tool finished"},
+            item={"type": "agentMessage", "id": "m1", "phase": "final_answer", "text": "tool finished"},
             threadId="t", turnId="tu1",
         )
         client.queue_notification(

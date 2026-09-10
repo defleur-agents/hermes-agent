@@ -158,13 +158,46 @@ class TestStreamDeltaDispatch:
     def test_agent_message_delta_fires_stream_delta(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage", "id": "am-final", "phase": "final_answer",
+        }))
         bridge({"method": "item/agentMessage/delta",
-                "params": {"delta": "hello "}})
+                "params": {"itemId": "am-final", "delta": "hello "}})
         bridge({"method": "item/agentMessage/delta",
-                "params": {"delta": "world"}})
+                "params": {"itemId": "am-final", "delta": "world"}})
         assert agent._fire_stream_delta.call_count == 2
         assert agent._fire_stream_delta.call_args_list[0].args == ("hello ",)
         assert agent._fire_stream_delta.call_args_list[1].args == ("world",)
+
+    def test_commentary_delta_waits_for_completed_item(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage", "id": "am-commentary", "phase": "commentary",
+        }))
+        bridge({"method": "item/agentMessage/delta",
+                "params": {"itemId": "am-commentary", "delta": "I'll inspect "}})
+        bridge({"method": "item/agentMessage/delta",
+                "params": {"itemId": "am-commentary", "delta": "the files."}})
+
+        agent._fire_stream_delta.assert_not_called()
+        agent._emit_interim_assistant_message.assert_not_called()
+
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-commentary", "phase": "commentary",
+            "text": "I'll inspect the files.",
+        }))
+        agent._emit_interim_assistant_message.assert_called_once_with(
+            {"role": "assistant", "content": "I'll inspect the files."}
+        )
+
+    def test_unknown_phase_delta_fails_closed(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "item/agentMessage/delta",
+                "params": {"itemId": "unknown", "delta": "unclassified"}})
+        agent._fire_stream_delta.assert_not_called()
+        agent._emit_interim_assistant_message.assert_not_called()
 
 
 
@@ -256,11 +289,29 @@ class TestAgentMessageInterimDispatch:
         bridge(_item_completed({
             "type": "agentMessage",
             "id": "am-1",
+            "phase": "commentary",
             "text": "I'll check the config first.",
         }))
         agent._emit_interim_assistant_message.assert_called_once_with(
             {"role": "assistant", "content": "I'll check the config first."}
         )
+
+    def test_completed_final_answer_is_not_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-final", "phase": "final_answer",
+            "text": "Done.",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
+
+    def test_completed_message_without_phase_fails_closed(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-unclassified", "text": "Maybe commentary.",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
 
 
 
@@ -272,7 +323,8 @@ class TestAgentMessageInterimDispatch:
         agent.show_commentary = False
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
-            "type": "agentMessage", "id": "am-5", "text": "I'll check config.",
+            "type": "agentMessage", "id": "am-5", "phase": "commentary",
+            "text": "I'll check config.",
         }))
         agent._emit_interim_assistant_message.assert_not_called()
         # Tool progress is unaffected by the commentary toggle.
@@ -305,7 +357,7 @@ class TestBridgeRobustness:
         bridge({"method": "item/agentMessage/delta",
                 "params": {"delta": "x"}})
         bridge(_item_completed({
-            "type": "agentMessage", "id": "am-x", "text": "hi",
+            "type": "agentMessage", "id": "am-x", "phase": "commentary", "text": "hi",
         }))
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,10 @@ def adapter_supports_push(adapter: Any) -> bool:
     return bool(getattr(adapter, "supports_async_delivery", True))
 
 
-async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None) -> None:
+async def deliver_wake(
+    adapter: Any, *, text: str, session_id: str = "", source: Any = None,
+    idempotency_key: str = "",
+) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. Raises on
@@ -50,7 +54,10 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     if not session_id:
         raise ValueError("deliver_wake: non-push adapter (supports_async_delivery=False) "
                          "requires the raw session id to self-post the wake turn")
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    kwargs = {"idempotency_key": idempotency_key} if idempotency_key else {}
+    await _self_post_chat_completion(
+        adapter, text=text, session_id=session_id, **kwargs,
+    )
 
 
 def _delegation_display_metadata(evt: dict) -> dict:
@@ -101,7 +108,9 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     )
 
 
-async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str) -> None:
+async def _self_post_chat_completion(
+    adapter: Any, *, text: str, session_id: str, idempotency_key: str = "",
+) -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -119,7 +128,16 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
     url = f"http://{host}:{port}/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
+    # One admission key is reused across every retry in this call. If the API accepted the
+    # first POST but the client timed out waiting behind a busy session, later attempts join
+    # the same in-flight turn instead of queueing duplicate user messages. Callers may supply
+    # a durable key; otherwise keep the scope deliberately local to this bounded retry loop.
+    request_key = idempotency_key or f"wake:{uuid.uuid4().hex}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Hermes-Session-Id": session_id,
+        "Idempotency-Key": request_key,
+    }
     payload = {"model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
                "messages": [{"role": "user", "content": text}], "stream": False}
     last_err: Optional[BaseException] = None

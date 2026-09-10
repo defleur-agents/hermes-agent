@@ -109,7 +109,7 @@ class TestAgentMessageProjection:
         r = p.project({
             "method": "item/completed",
             "params": {"item": {"type": "agentMessage", "id": "x",
-                                "text": "hi there"}},
+                                "phase": "final_answer", "text": "hi there"}},
         })
         assert r.final_text == "hi there"
         assert r.messages == [{"role": "assistant", "content": "hi there"}]
@@ -129,7 +129,7 @@ class TestAgentMessageProjection:
         r2 = p.project({
             "method": "item/completed",
             "params": {"item": {"type": "agentMessage", "id": "a1",
-                                "text": "ok"}},
+                                "phase": "final_answer", "text": "ok"}},
         })
         assistant = r2.messages[0]
         assert "reasoning" in assistant
@@ -141,11 +141,32 @@ class TestAgentMessageProjection:
         p.project({"method": "item/completed", "params": {"item": {
             "type": "reasoning", "id": "r1", "summary": ["once"], "content": []}}})
         first = p.project({"method": "item/completed", "params": {"item": {
-            "type": "agentMessage", "id": "a", "text": "first"}}}).messages[0]
+            "type": "agentMessage", "id": "a", "phase": "final_answer", "text": "first"}}}).messages[0]
         second = p.project({"method": "item/completed", "params": {"item": {
-            "type": "agentMessage", "id": "b", "text": "second"}}}).messages[0]
+            "type": "agentMessage", "id": "b", "phase": "final_answer", "text": "second"}}}).messages[0]
         assert "reasoning" in first
         assert "reasoning" not in second
+
+    def test_commentary_is_durable_but_never_canonical_final_text(self) -> None:
+        p = CodexEventProjector()
+        result = p.project({"method": "item/completed", "params": {"item": {
+            "type": "agentMessage", "id": "commentary", "phase": "commentary",
+            "text": "Checking the relevant implementation.",
+        }}})
+        assert result.messages == [{
+            "role": "assistant", "content": "Checking the relevant implementation.",
+        }]
+        assert result.final_text is None
+
+    def test_unknown_or_missing_phase_fails_closed(self) -> None:
+        p = CodexEventProjector()
+        for phase in (None, "analysis", "future_phase"):
+            item = {"type": "agentMessage", "id": "unknown", "text": "private-ish text"}
+            if phase is not None:
+                item["phase"] = phase
+            result = p.project({"method": "item/completed", "params": {"item": item}})
+            assert result.messages == []
+            assert result.final_text is None
 
 
 class TestFileChangeProjection:

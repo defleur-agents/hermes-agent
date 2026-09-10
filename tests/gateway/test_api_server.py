@@ -217,9 +217,12 @@ class TestAdapterInit:
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
 
-        agent = adapter._create_agent(session_id="api-session")
+        interim_callback = MagicMock()
+        agent = adapter._create_agent(
+            session_id="api-session", interim_assistant_callback=interim_callback)
 
         assert isinstance(agent, FakeAgent)
+        assert captured["interim_assistant_callback"] is interim_callback
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
         assert captured["checkpoints_enabled"] is True
         assert captured["checkpoint_max_snapshots"] == 7

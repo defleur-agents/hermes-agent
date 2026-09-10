@@ -37,8 +37,10 @@ _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
 _USAGE_FIELDS = (
     ("input_tokens", "session_prompt_tokens"), ("output_tokens", "session_completion_tokens"),
     ("total_tokens", "session_total_tokens"))
-# Tool-progress event -> SSE payload fields (tool_name, preview, kwargs); key order is wire format.
+# Agent callback event -> SSE payload fields (tool_name, preview, kwargs); key order is wire format.
 _FIXED_EVENT_FIELDS = {
+    "message.interim": lambda tool, preview, kw: {
+        "text": preview or "", "already_streamed": bool(kw.get("already_streamed", False))},
     "tool.started": lambda tool, preview, kw: {"tool": tool, "preview": preview},
     "tool.completed": lambda tool, preview, kw: {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
@@ -161,7 +163,10 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
         # lifecycle boundaries must land so clients can observe delegate_task failures.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
         if fields is not None:
-            _push(_run_event(run_id, event_type, **fields(tool_name, preview, kwargs)))
+            payload = fields(tool_name, preview, kwargs)
+            if event_type == "message.interim":
+                payload["text"] = redact_sensitive_text(str(payload["text"]), force=True)
+            _push(_run_event(run_id, event_type, **payload))
         elif event_type in {"subagent.start", "subagent.complete"}:
             event = _run_event(run_id, event_type)
             if preview is not None:
@@ -562,9 +567,13 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
+        event_cb = self._make_run_event_callback(run_id, loop)
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                stream_delta_callback=_text_cb,
+                interim_assistant_callback=lambda text, *, already_streamed=False: event_cb(
+                    "message.interim", preview=text, already_streamed=already_streamed),
+                tool_progress_callback=event_cb,
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)

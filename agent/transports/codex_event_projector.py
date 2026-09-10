@@ -75,7 +75,16 @@ class CodexEventProjector:
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
         text = item.get("text") or ""
-        return ProjectionResult(messages=[self._assistant_message(text)], final_text=text)
+        phase = str(item.get("phase") or "").strip().lower()
+        if phase == "commentary":
+            # Preserve authored progress in durable history without allowing a
+            # mid-turn note to replace the canonical final response.
+            return ProjectionResult(messages=[self._assistant_message(text)])
+        if phase == "final_answer":
+            return ProjectionResult(messages=[self._assistant_message(text)], final_text=text)
+        # New or missing phases fail closed: they are neither persisted as
+        # assistant text nor promoted to the user-visible final answer.
+        return ProjectionResult()
 
     @staticmethod
     def _project_user_message(item: dict) -> ProjectionResult:

@@ -283,12 +283,17 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     """Build the ``on_event`` callback for ``CodexAppServerSession(on_event=...)``.
 
     Tool items fire ``tool_progress_callback`` plus the stable-ID ``tool_start_callback`` /
-    ``tool_complete_callback`` card hooks; deltas go to ``_fire_stream_delta`` / ``_fire_reasoning_delta``;
-    a completed agentMessage goes to ``_emit_interim_assistant_message`` (the gateway's ``already_streamed``
-    check dedupes against streamed deltas). Every callback is guarded so a buggy display hook cannot
-    tear down the turn loop."""
+    ``tool_complete_callback`` card hooks; classified final-answer deltas go to
+    ``_fire_stream_delta`` and reasoning deltas to ``_fire_reasoning_delta``. Completed
+    commentary items go to ``_emit_interim_assistant_message`` without first entering the
+    final stream. Every callback is guarded so a buggy display hook cannot tear down the turn
+    loop."""
     # item_id -> (tool_name, args, started_monotonic); duration even when codex omits durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    # Codex sends ``phase`` on the agentMessage item lifecycle and only
+    # ``itemId`` on deltas. Keep that association so commentary never enters
+    # the final-answer stream before its completed item can be classified.
+    message_phases: dict[str, str] = {}
 
     def agent_cb(attr: str, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None) -> None:
         _call_guarded(getattr(agent, attr, None), fail_msg, *fail_args, args=args, kwargs=kwargs)
@@ -328,10 +333,17 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if isinstance(text, str) and text:
             agent_cb(attr, f"{attr} raised", args=(text,))
 
-    def _fire_agent_message_completed(item: dict) -> None:
+    def _fire_agent_message_delta(params: dict) -> None:
+        item_id = params.get("itemId") or params.get("item_id") or ""
+        phase = message_phases.get(str(item_id), "") if item_id else ""
+        if phase == "final_answer":
+            _fire_delta(params, "_fire_stream_delta")
+
+    def _fire_agent_message_completed(item: dict, phase: str) -> None:
         text = item.get("text") or ""
         # display.show_commentary=false keeps mid-turn narration off the interim path too (codex_responses contract).
-        if isinstance(text, str) and text.strip() and getattr(agent, "show_commentary", True):
+        if (phase == "commentary" and isinstance(text, str) and text.strip()
+                and getattr(agent, "show_commentary", True)):
             agent_cb("_emit_interim_assistant_message", "_emit_interim_assistant_message raised",
                      args=({"role": "assistant", "content": text},))
 
@@ -342,17 +354,32 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         item_type = item.get("type") or ""
         if item_type in _CODEX_TOOL_ITEM_TYPES:
             (_fire_tool_completed if completed else _fire_tool_started)(item)
-        elif completed and item_type == "agentMessage":
-            _fire_agent_message_completed(item)
+        elif item_type == "agentMessage":
+            item_id = str(item.get("id") or "")
+            phase = str(item.get("phase") or (message_phases.get(item_id) if item_id else "") or "")
+            if completed:
+                if phase and not item.get("phase"):
+                    # The projector runs immediately after this callback. Carry
+                    # forward a known item/started phase when Codex omits it on
+                    # item/completed so final/history classification stays safe.
+                    item["phase"] = phase
+                _fire_agent_message_completed(item, phase)
+                if item_id:
+                    message_phases.pop(item_id, None)
+            elif item_id:
+                message_phases[item_id] = phase
     handlers: dict[str, Callable[[dict], None]] = {
-        "item/agentMessage/delta": lambda p: _fire_delta(p, "_fire_stream_delta"),
+        "item/agentMessage/delta": _fire_agent_message_delta,
         "item/reasoning/delta": lambda p: _fire_delta(p, "_fire_reasoning_delta"),
         "item/reasoning/summaryDelta": lambda p: _fire_delta(p, "_fire_reasoning_delta"),
         "item/started": lambda p: _on_item(p, completed=False), "item/completed": lambda p: _on_item(p, completed=True),
     }
 
     def on_event(note: dict) -> None:
-        handler = handlers.get(note.get("method") or "") if isinstance(note, dict) else None
+        method = (note.get("method") or "") if isinstance(note, dict) else ""
+        if method in {"turn/started", "turn/completed"}:
+            message_phases.clear()
+        handler = handlers.get(method)
         if handler is not None:
             params = note.get("params")
             handler(params if isinstance(params, dict) else {})

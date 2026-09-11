@@ -3544,7 +3544,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @staticmethod
     def _bind_api_server_session(
         *, chat_id: str = "", session_key: str = "", session_id: str = "",
-        browser_control_principal: str = "", browser_control_transport_family: str = "") -> list:
+        browser_control_principal: str = "", browser_control_transport_family: str = "",
+        delegation_delivery: str = "background") -> list:
         """Bind session contextvars for an API-server agent run — the SINGLE chokepoint for every
         agent-entry path. Hardwires ``platform="api_server"`` + ``async_delivery=False`` (HTTP
         can never wake the agent after the turn) so no route reintroduces the silent no-op bug.
@@ -3557,7 +3558,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             platform="api_server", chat_id=chat_id, session_key=session_key, session_id=session_id,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
-            async_delivery=False, cron_session="")
+            async_delivery=False, cron_session="", delegation_delivery=delegation_delivery)
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[Dict[str, Any]], requested_runtime: Optional[Dict[str, Any]],

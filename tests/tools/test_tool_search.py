@@ -61,6 +61,91 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_eager_tools_are_normalized_and_invalid_names_dropped(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({
+            "eager_tools": ["conversation_evidence_search", "", "bad tool name", 7],
+        })
+        assert cfg.eager_tools == frozenset({"conversation_evidence_search"})
+
+    def test_eager_tool_stays_direct_and_out_of_every_bridge_path(self, monkeypatch):
+        from tools.registry import registry
+        import tools.tool_search as tool_search
+
+        eager_name = "mcp_eager_contract_capability"
+        deferred_name = "mcp_deferred_contract_capability"
+        toolset = "mcp-eager-contract"
+        registry.register(
+            name=eager_name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True, "value": args.get("value")}),
+            schema=_td(eager_name, "Eager contract capability"),
+            toolset=toolset,
+        )
+        registry.register(
+            name=deferred_name,
+            handler=lambda args, **kwargs: json.dumps({"ok": True}),
+            schema=_td(deferred_name, "Deferred contract capability"),
+            toolset=toolset,
+        )
+        defs = [
+            _td(eager_name, "Eager contract capability"),
+            _td(deferred_name, "Deferred contract capability"),
+        ]
+        config = tool_search.ToolSearchConfig.from_raw(
+            {
+                "enabled": "on",
+                "eager_tools": [eager_name],
+                "defer_tools": [eager_name, deferred_name],
+            }
+        )
+
+        assembled = tool_search.assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=config,
+        )
+        direct_names = {item["function"]["name"] for item in assembled.tool_defs}
+        assert eager_name in direct_names
+        assert deferred_name not in direct_names
+        assert tool_search.BRIDGE_TOOL_NAMES <= direct_names
+
+        searched = json.loads(
+            tool_search.dispatch_tool_search(
+                {"queries": ["contract capability"]},
+                current_tool_defs=defs,
+                config=config,
+            )
+        )
+        assert eager_name not in searched["tools"]
+        assert all(eager_name not in group["matches"] for group in searched["results"])
+
+        described = json.loads(
+            tool_search.dispatch_tool_describe(
+                {"names": [eager_name, deferred_name]},
+                current_tool_defs=defs,
+                config=config,
+            )
+        )
+        assert eager_name not in described["tools"]
+        assert eager_name in described["errors"]
+        assert deferred_name in described["tools"]
+
+        monkeypatch.setattr(tool_search, "load_config_readonly", lambda: config)
+        scoped = tool_search.scoped_deferrable_names(defs)
+        assert eager_name not in scoped
+        assert deferred_name in scoped
+        name, args, error = tool_search.resolve_underlying_call(
+            {"name": eager_name, "arguments": {"value": 7}}
+        )
+        assert name is None and args == {}
+        assert "call it directly" in str(error)
+        direct_result = registry.dispatch(eager_name, {"value": 7})
+        assert isinstance(direct_result, str)
+        assert json.loads(direct_result) == {
+            "ok": True,
+            "value": 7,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -200,6 +285,42 @@ class TestClassification:
         names = {td["function"]["name"] for td in assembled.tool_defs}
         assert "clarify" in names
         assert "computer_use" not in names
+
+    def test_operator_pinned_plugin_tool_stays_direct(self):
+        from tools.registry import registry
+        from tools.tool_search import BRIDGE_TOOL_NAMES, ToolSearchConfig, assemble_tool_defs
+
+        eager_name = "conversation_evidence_search_test"
+        deferred_name = "other_plugin_tool_test"
+        registry.register(
+            name=eager_name,
+            handler=lambda args, **kw: "{}",
+            schema=_td(eager_name, "Primary conversation evidence retrieval")["function"],
+            toolset="conversation_evidence_test",
+        )
+        registry.register(
+            name=deferred_name,
+            handler=lambda args, **kw: "{}",
+            schema=_td(deferred_name, "Another plugin capability")["function"],
+            toolset="other_plugin_test",
+        )
+        try:
+            assembled = assemble_tool_defs(
+                [_td(eager_name), _td(deferred_name)],
+                context_length=200_000,
+                config=ToolSearchConfig.from_raw({
+                    "enabled": "on",
+                    "eager_tools": [eager_name],
+                }),
+            )
+            names = {td["function"]["name"] for td in assembled.tool_defs}
+            assert assembled.activated
+            assert eager_name in names
+            assert deferred_name not in names
+            assert BRIDGE_TOOL_NAMES <= names
+        finally:
+            registry.deregister(eager_name)
+            registry.deregister(deferred_name)
 
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must

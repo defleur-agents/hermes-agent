@@ -52,6 +52,11 @@ _SESSION_VARS = (
 # adapters (API server, Kanban workers) opt OUT via ``supports_async_delivery = False`` at bind.
 _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Per-turn delegated-work delivery policy.  ``background`` preserves the normal
+# channel behavior; ``join`` keeps delegated children inside the originating
+# finite run so its parent can integrate and verify them before returning.
+_SESSION_DELEGATION_DELIVERY = ContextVar("HERMES_SESSION_DELEGATION_DELIVERY", default=_UNSET)
+
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
@@ -107,7 +112,7 @@ def set_session_vars(
     user_name: str = "", scope_id: str = "", session_key: str = "", session_id: str = "",
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
-    ui_session_id: str = "", cron_session: Any = _UNSET,
+    ui_session_id: str = "", cron_session: Any = _UNSET, delegation_delivery: str = "background",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -121,6 +126,7 @@ def set_session_vars(
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
+    tokens.append(_SESSION_DELEGATION_DELIVERY.set(delegation_delivery))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -132,6 +138,7 @@ def clear_session_vars(tokens: list) -> None:
     for var in _SESSION_VARS:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_DELEGATION_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -143,6 +150,7 @@ def reset_session_vars() -> None:
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_DELEGATION_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -191,3 +199,13 @@ def async_delivery_supported() -> bool:
         return False
     value = _SESSION_ASYNC_DELIVERY.get()
     return True if value is _UNSET else bool(value)
+
+
+def delegation_delivery_mode() -> str:
+    """Return the explicit per-turn delegated-work policy.
+
+    Unknown and unbound values fail closed to the established ``background``
+    behavior.  API surfaces validate the wire value before binding it.
+    """
+    value = _SESSION_DELEGATION_DELIVERY.get()
+    return value if value in {"background", "join"} else "background"

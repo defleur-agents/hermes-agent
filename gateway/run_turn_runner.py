@@ -754,7 +754,17 @@ class TurnRunner:
             else:
                 return
             agent._on_session_title = lambda title, title_source: (
-                title_source == "llm" and getattr(runner, lane)(source, session_id, title)
+                title_source == "llm"
+                and getattr(runner, lane)(
+                    source,
+                    session_id,
+                    title,
+                    **(
+                        {"user_message": getattr(ctx, "message", "") or ""}
+                        if lane == "_schedule_telegram_topic_title_rename"
+                        else {}
+                    ),
+                )
             )
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)

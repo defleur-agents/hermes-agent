@@ -208,7 +208,7 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
-    async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
+    async def test_start_binds_chat_id_and_explicit_delegation_delivery_policy(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
         delegation dispatch reads HERMES_SESSION_CHAT_ID to pick its wake
@@ -222,9 +222,11 @@ class TestStartRun:
                 mock_agent = MagicMock()
 
                 def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    from gateway.session_context import delegation_delivery_mode
                     from tools.async_delegation import _current_origin_session_id
 
                     captured["origin_session_id"] = _current_origin_session_id()
+                    captured["delegation_delivery"] = delegation_delivery_mode()
                     return {"final_response": "done"}
 
                 mock_agent.run_conversation.side_effect = _capture_run
@@ -235,7 +237,11 @@ class TestStartRun:
 
                 resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "hello", "session_id": "runs-raw-sid"},
+                    json={
+                        "input": "hello",
+                        "session_id": "legacy-session-without-client-prefix",
+                        "delegation_delivery": "join",
+                    },
                 )
                 assert resp.status == 202
                 data = await resp.json()
@@ -248,9 +254,24 @@ class TestStartRun:
                         break
                     await asyncio.sleep(0.05)
 
-        assert captured.get("origin_session_id") == "runs-raw-sid", (
+        assert captured.get("origin_session_id") == "legacy-session-without-client-prefix", (
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
+        assert captured.get("delegation_delivery") == "join"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_policy", ["detach-somewhere", None, [], 7])
+    async def test_start_rejects_unknown_delegation_delivery_policy(self, adapter, bad_policy):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "delegation_delivery": bad_policy},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["code"] == "invalid_delegation_delivery"
 
 
     @pytest.mark.asyncio

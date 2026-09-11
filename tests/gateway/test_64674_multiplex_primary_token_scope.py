@@ -254,6 +254,7 @@ class TestPrimaryMessageRuntimeScope:
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = lambda _source: home
 
         async def _handle_message(_event):
             from gateway.session import _discord_tools_loaded
@@ -266,6 +267,47 @@ class TestPrimaryMessageRuntimeScope:
         assert await handler(SimpleNamespace(source=SimpleNamespace(profile=None))) is True
         with pytest.raises(secret_scope.UnscopedSecretError):
             secret_scope.get_secret("DISCORD_BOT_TOKEN")
+
+    @pytest.mark.asyncio
+    async def test_profile_routed_primary_message_uses_secondary_db_scope(
+        self, tmp_path, monkeypatch
+    ):
+        """A shared primary adapter must not split one turn across profile DBs."""
+        from gateway import run as run_mod
+        from gateway.run import GatewayRunner
+        import hermes_state
+        from hermes_state import _default_db_path
+
+        default_home = tmp_path / "default"
+        profile_home = tmp_path / "profiles" / "tinfoilglm"
+        default_home.mkdir()
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(run_mod, "get_hermes_home", lambda: default_home)
+        # The suite fixture pins DEFAULT_DB_PATH to its sandbox. Production keeps
+        # it at the import default, where _default_db_path resolves the active
+        # profile context at call time; restore that production relationship for
+        # this scoped-routing regression.
+        monkeypatch.setattr(
+            hermes_state,
+            "DEFAULT_DB_PATH",
+            hermes_state._IMPORT_DEFAULT_DB_PATH,
+        )
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = lambda _source: profile_home
+
+        async def _handle_message(_event):
+            return Path(_default_db_path())
+
+        runner._handle_message = _handle_message  # type: ignore[method-assign]
+        handler = runner._primary_message_handler()
+
+        resolved_db = await handler(
+            SimpleNamespace(source=SimpleNamespace(profile="tinfoilglm"))
+        )
+
+        assert resolved_db == profile_home / "state.db"
 
 
 class TestReconnectDropsEmptyToken:

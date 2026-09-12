@@ -19,6 +19,8 @@ live-writer guard.)
 from __future__ import annotations
 
 import errno
+import io
+import os
 import select
 import sqlite3
 import subprocess
@@ -118,6 +120,101 @@ def test_linux_holder_scan_does_not_require_psutil(tmp_path, monkeypatch):
     )
 
     assert holders == []
+
+
+@pytest.mark.linux_only
+def test_uninspectable_foreign_hermes_process_fenced_by_private_path_is_ignored(
+    tmp_path, monkeypatch
+):
+    """A different uid behind hidepid is not a holder of a private database."""
+    db = tmp_path / "state.db"
+    db.touch(mode=0o600)
+
+    def _listdir(path):
+        if path == "/proc":
+            return ["4242"]
+        if path == "/proc/4242/fd":
+            raise PermissionError(errno.EACCES, "hidepid", path)
+        raise AssertionError(f"unexpected scan path: {path}")
+
+    monkeypatch.setattr(hermes_state_holders.os, "listdir", _listdir)
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "_read_proc_argv",
+        lambda _pid: ["python3", "-m", "hermes_cli.main", "gateway"],
+    )
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "_read_proc_credentials",
+        lambda _pid: (os.geteuid() + 1000, {os.getegid() + 1000}, False),
+    )
+
+    assert hermes_state_holders.foreign_state_db_holders(db) == []
+
+
+@pytest.mark.linux_only
+def test_proc_credentials_use_filesystem_ids_and_include_filesystem_gid(monkeypatch):
+    """Permission checks must model Linux's fsuid/fsgid credentials."""
+    status = """\
+Uid:\t1000\t2000\t3000\t4000
+Gid:\t100\t200\t300\t400
+Groups:\t27 100 200
+CapEff:\t0000000000000000
+"""
+
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: io.StringIO(status),
+    )
+
+    assert hermes_state_holders._read_proc_credentials(4242) == (
+        4000,
+        {27, 100, 200, 400},
+        False,
+    )
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("capability_bit", (1, 2))
+def test_proc_credentials_detect_dac_bypass_capabilities(
+    monkeypatch, capability_bit
+):
+    """CAP_DAC_OVERRIDE/READ_SEARCH keep an uninspectable holder blocking."""
+    status = f"""\
+Uid:\t1000\t2000\t3000\t4000
+Gid:\t100\t200\t300\t400
+Groups:\t27 100
+CapEff:\t{1 << capability_bit:016x}
+"""
+
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: io.StringIO(status),
+    )
+
+    assert hermes_state_holders._read_proc_credentials(4242) == (
+        4000,
+        {27, 100, 400},
+        True,
+    )
+
+
+@pytest.mark.linux_only
+def test_uninspectable_process_with_dac_capability_is_never_ignored(
+    tmp_path, monkeypatch
+):
+    """Mode bits cannot fence a process that can bypass DAC checks."""
+    db = tmp_path / "state.db"
+    db.touch(mode=0o600)
+    monkeypatch.setattr(
+        hermes_state_holders,
+        "_read_proc_credentials",
+        lambda _pid: (os.geteuid() + 1000, set(), True),
+    )
+
+    assert hermes_state_holders._process_may_access_watched_paths(
+        4242, (str(db),)
+    ) is True
 
 
 @pytest.mark.linux_only

@@ -128,21 +128,26 @@ def _is_cron_approval_context() -> bool:
     return is_truthy_value(_session_env("HERMES_CRON_SESSION"))
 
 
-# Programmatic/unattended platforms: no human can answer a prompt and the adapter has no ``send_exec_approval`` /
-# ``/approve`` surface. Governed by ``approvals.unattended_mode`` (default deny), mirroring ``cron_mode`` — never an
-# interactive round-trip that blocks for the full timeout with nobody to answer.
+# Programmatic/unattended platforms default to no human round-trip. A /v1/runs request can opt api_server out when it
+# has registered the live /approval bridge; every other entry path remains governed by ``approvals.unattended_mode``.
 _UNATTENDED_APPROVAL_PLATFORMS = frozenset({"webhook", "msgraph_webhook", "api_server"})
 
 
 def _is_unattended_platform_approval_context() -> bool:
     """True when the session platform is a programmatic/unattended surface.
 
-    Webhook, msgraph_webhook, and api_server sessions bind ``HERMES_SESSION_PLATFORM`` like chat gateways
-    do, but there is no human who can resolve a pending approval. Treating them as gateway approval contexts
-    blocks the session for the full approval timeout (60-300s) and then fails closed anyway — the deadlock
-    in #37284/#87509.
+    Webhook, msgraph_webhook, and ordinary api_server sessions have no human who can resolve a pending approval.
+    A /v1/runs request is the exception when it explicitly binds the live approval-delivery capability.
     """
-    return _get_session_platform() in _UNATTENDED_APPROVAL_PLATFORMS
+    platform = _get_session_platform()
+    if platform == "api_server":
+        try:
+            from gateway.session_context import approval_delivery_supported
+            if approval_delivery_supported():
+                return False
+        except Exception:
+            pass
+    return platform in _UNATTENDED_APPROVAL_PLATFORMS
 
 
 def _is_single_query_approval_context() -> bool:
@@ -163,8 +168,8 @@ def _is_gateway_approval_context() -> bool:
     delivery routing): falling through would submit a pending approval with no
     listener and block the job indefinitely; unattended platforms likewise.
 
-    Unattended programmatic platforms (webhook, msgraph_webhook, api_server) are excluded for the same
-    reason: those adapters have no ``send_exec_approval`` and no way to receive ``/approve`` replies.
+    Unattended programmatic platforms (webhook, msgraph_webhook, ordinary api_server requests) are excluded for the
+    same reason: those adapters have no ``send_exec_approval`` and no way to receive ``/approve`` replies.
     Submitting a pending approval there blocks the session for the full approval timeout (60-300 s) with no
     human who can resolve it (#37284, 87509). Their dangerous-command handling is governed by
     ``approvals.unattended_mode`` config (default deny), mirroring cron.

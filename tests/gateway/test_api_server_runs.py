@@ -219,9 +219,11 @@ class TestStartRun:
                 mock_agent = MagicMock()
 
                 def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    from gateway.session_context import approval_delivery_supported
                     from tools.async_delegation import _current_origin_session_id
 
                     captured["origin_session_id"] = _current_origin_session_id()
+                    captured["approval_delivery"] = approval_delivery_supported()
                     return {"final_response": "done"}
 
                 mock_agent.run_conversation.side_effect = _capture_run
@@ -248,6 +250,7 @@ class TestStartRun:
         assert captured.get("origin_session_id") == "runs-raw-sid", (
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
+        assert captured.get("approval_delivery") is True
 
     @staticmethod
     async def _wait_completed(cli, run_id: str) -> None:

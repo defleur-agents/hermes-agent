@@ -754,6 +754,32 @@ class TestWebhookApprovalExclusion:
             monkeypatch.setenv("HERMES_SESSION_PLATFORM", platform)
             assert _is_gateway_approval_context() is False, platform
 
+    def test_api_run_with_approval_delivery_is_a_gateway_context(self, monkeypatch):
+        """The runs API has a live /approval endpoint and must use it instead of unattended policy."""
+        from gateway.session_context import reset_session_vars, set_session_vars
+        from tools.approval import _is_gateway_approval_context
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        set_session_vars(platform="api_server", approval_delivery=True)
+        try:
+            assert _is_gateway_approval_context() is True
+        finally:
+            reset_session_vars()
+
+    def test_delegated_child_cannot_inherit_api_approval_delivery(self, monkeypatch):
+        """A child can outlive its parent run, so inherited ContextVars never promise a dead callback."""
+        from agent.delegation_context import delegated_child_context
+        from gateway.session_context import reset_session_vars, set_session_vars
+        from tools.approval import _is_gateway_approval_context
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        set_session_vars(platform="api_server", approval_delivery=True)
+        try:
+            with delegated_child_context("child-session"):
+                assert _is_gateway_approval_context() is False
+        finally:
+            reset_session_vars()
+
     def test_non_webhook_gateway_session_returns_true(self, monkeypatch):
         """Non-webhook gateway sessions (e.g. Telegram) are still gateway contexts."""
         from tools.approval import _is_gateway_approval_context

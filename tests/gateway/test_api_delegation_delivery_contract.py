@@ -35,6 +35,7 @@ async def test_detached_dispatch_requires_a_declared_consumer(monkeypatch):
         assert request["status"] == 200
         runtime = request["runtime"]
         assert runtime["target"] == ("child" if request["explicit"] else None)
+        assert runtime["completion_delivery"] == ("api_session_wake" if request["explicit"] else "")
         if request["explicit"]:
             assert runtime["session_id"] == "child"
             assert request["header"] == "parent"
@@ -46,6 +47,11 @@ async def test_detached_dispatch_requires_a_declared_consumer(monkeypatch):
     for name in ("caller_history", "response_chain"):
         assert runs[name]["runtime"]["target"] is None
         assert runs[name]["runtime"]["history"] == [{"role": "user", "content": "caller snapshot"}]
+        # Same audit governs the durable background-completion route: a chain that never reloads
+        # session history cannot consume a completion delivered into it either.
+        assert runs[name]["runtime"]["completion_delivery"] == ""
+    for name in ("session", "declared_key"):
+        assert runs[name]["runtime"]["completion_delivery"] == "api_session_wake"
     assert runs["session"]["runtime"]["target"] == "child"
     assert runs["session"]["runtime"]["history"] == result["resumed_history"]
     assert runs["declared_key"]["runtime"]["target"] == "declared"

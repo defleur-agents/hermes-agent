@@ -41,7 +41,9 @@ async def probe():
             args = [sid]
             if len(inspect.signature(_resolve_async_wake_sid).parameters) > 1:
                 args.append(sc.session_history_delivery_supported())
-            captured.append({"session_id": sid, "target": _resolve_async_wake_sid(*args), "history": turn.get("conversation_history")})
+            captured.append({"session_id": sid, "target": _resolve_async_wake_sid(*args),
+                             "completion_delivery": sc.completion_delivery_mode(),
+                             "history": turn.get("conversation_history")})
             callback = kwargs.get("stream_delta_callback")
             if callback:
                 callback("fixture reply")

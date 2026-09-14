@@ -165,15 +165,15 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
     # session_key falls back to the raw task_id when no gateway contextvar is set
     # (it doesn't propagate to tool-worker threads), so process.kill / stop can
     # still find and terminate this background process.
-    assert registry.calls == [{
-        "command": "sleep 1",
-        "cwd": "/workspace/live",
-        "task_id": task_id,
-        "owner_task_id": task_id,
-        "session_key": task_id,
-        "env_vars": {},
-        "use_pty": False,
-    }]
+    # Asserted per key rather than as a whole-dict snapshot: the spawn call also carries
+    # notification/routing metadata resolved before the spawn, which this test says nothing about.
+    (call,) = registry.calls
+    assert call["command"] == "sleep 1"
+    assert call["cwd"] == "/workspace/live"
+    assert call["task_id"] == call["owner_task_id"] == task_id
+    assert call["session_key"] == task_id
+    assert call["env_vars"] == {}
+    assert call["use_pty"] is False
 
 
 def test_host_local_background_command_bypasses_configured_backend(tmp_path, monkeypatch):

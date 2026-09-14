@@ -992,6 +992,15 @@ class TestCapabilitiesEndpoint:
                 "default": "plain_text",
                 "scope": "request",
             }
+            # Clients that dispatch long work need to know, before dispatching, whether a
+            # detached worker's completion can reach them once the finite run has ended.
+            assert data["features"]["background_process_completion"] == {
+                "supported": True,
+                "mode": "api_session_wake",
+                "requires": ["authenticated_session", "server_owned_history"],
+                "delivery": "session_wake_turn",
+                "watch_patterns": False,
+            }
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}

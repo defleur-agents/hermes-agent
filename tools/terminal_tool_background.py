@@ -53,6 +53,26 @@ _ASYNC_UNSUPPORTED_NOTE = (
     "background; retrieve its result with process(action='poll') or process(action='wait')."
 )
 
+# A finite API run ENDS when its HTTP turn returns. Detaching a notify-on-complete worker there
+# without a durable completion route is the "Executing now" failure: the worker dies or finishes
+# after the run is gone and nothing ever resumes the session. Refuse the spawn outright so the
+# model learns inside the turn instead of promising a notification nobody can deliver.
+_API_DURABLE_UNSUPPORTED_ERROR = (
+    'This API session cannot receive a background notification after the turn ends, so NO process '
+    'was started (there is no PID to poll). This run is finite: it finishes when this response is '
+    'returned, and its session id is not one the server can resume. Run the command in the '
+    'FOREGROUND (background=false) and report the real result in this turn, or split the work so '
+    'each turn finishes what it starts.'
+)
+
+# The durable API wake replays ONE terminal completion into the session. Streaming interim
+# watch-pattern matches would each need their own authorized turn, which this route does not grant.
+_API_WATCH_UNSUPPORTED_NOTE = (
+    'watch_patterns are not available on API sessions: the durable completion route delivers a '
+    "process's FINAL outcome only, never interim pattern matches. Use notify_on_complete=true to "
+    "be told when it exits, or process(action='poll') to inspect it yourself."
+)
+
 # proc_session attribute -> HERMES_SESSION_* env var carrying it.
 _ROUTING_FIELDS = (
     ("watcher_chat_id", "HERMES_SESSION_CHAT_ID"),
@@ -74,43 +94,75 @@ def _looks_like_homebrew_ci_poller(command: str) -> bool:
     return "statusCheckRollup" in command or (has_gh and has_jq)
 
 
-def _stamp_gateway_routing(proc_session, get_session_env) -> None:
-    """Copy the spawning chat's routing metadata onto the process session so
-    completion / watch notifications reach the right chat/thread."""
+def _gateway_routing_fields(get_session_env) -> dict:
+    """The spawning chat's routing metadata, as ProcessSession field values, so completion /
+    watch notifications reach the right chat/thread. Empty when no platform is bound."""
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
     if not platform:
-        return
-    proc_session.watcher_platform = platform
-    for attr, var in _ROUTING_FIELDS:
-        setattr(proc_session, attr, get_session_env(var, ""))
+        return {}
+    return {"watcher_platform": platform,
+            **{attr: get_session_env(var, "") for attr, var in _ROUTING_FIELDS}}
+
+
+def _stamp_gateway_routing(proc_session, get_session_env) -> None:
+    """Apply :func:`_gateway_routing_fields` to an already-created session (adoption path)."""
+    for attr, value in _gateway_routing_fields(get_session_env).items():
+        setattr(proc_session, attr, value)
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-           session_key, effective_pty):
+           session_key, effective_pty, session_fields):
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
-                  owner_task_id=task_id or effective_task_id, session_key=session_key)
+                  owner_task_id=task_id or effective_task_id, session_key=session_key,
+                  session_fields=session_fields)
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty, **common)
     return process_registry.spawn_via_env(env=env, **common)
 
 
-def _apply_async_support(proc_session, result_data, notify_on_complete, watch_patterns):
-    """Finite sessions (stateless HTTP, one-shot Kanban workers) can't route a
-    completion back after the turn ends: drop the flags and tell the agent to
-    poll. Otherwise stamp gateway routing. Returns (notify, watch_patterns)."""
-    if not (notify_on_complete or watch_patterns):
-        return notify_on_complete, watch_patterns
-    from gateway.session_context import async_delivery_supported, get_session_env
+class _UnsupportedCompletion(Exception):
+    """The requested completion contract cannot be honored on this session — do not spawn."""
 
+
+def _resolve_completion_support(notify_on_complete, watch_patterns, result_data):
+    """Decide, BEFORE spawning, how this session can deliver a completion.
+
+    Returns the ``session_fields`` the spawn must pre-bind (routing, notify flag, durable mode)
+    and the effective ``watch_patterns``. Raises :class:`_UnsupportedCompletion` when a finite API
+    run asks for a notification nothing could ever deliver — refusing before the spawn is what
+    keeps an unsupported run from leaving a PID behind with a promise attached.
+    """
+    from gateway.session_context import (
+        async_delivery_supported, completion_delivery_mode, get_session_env)
+
+    if not (notify_on_complete or watch_patterns):
+        return {}, watch_patterns
+    routing = _gateway_routing_fields(get_session_env)
     if async_delivery_supported():
-        _stamp_gateway_routing(proc_session, get_session_env)
-        return notify_on_complete, watch_patterns
+        return {**routing, "notify_on_complete": bool(notify_on_complete)}, watch_patterns
+    mode = completion_delivery_mode()
+    if mode:
+        if watch_patterns:
+            # Watch-pattern streaming needs an authorized turn per match; the durable API route
+            # grants exactly one, for the terminal outcome.
+            result_data["watch_patterns_unsupported"] = _API_WATCH_UNSUPPORTED_NOTE
+            watch_patterns = None
+        if not notify_on_complete:
+            return {}, None
+        # The resumable destination is the bound chat id (the real session), never the
+        # run/approval session_key — that key is per-run and resumes no conversation.
+        if not routing.get("watcher_chat_id"):
+            raise _UnsupportedCompletion()
+        return {**routing, "notify_on_complete": True, "completion_delivery": mode,
+                "delivery_adapter_id": get_session_env("HERMES_SESSION_PLATFORM", "")}, None
+    if get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server":
+        raise _UnsupportedCompletion()
     result_data["notify_on_complete"] = False
     result_data["notify_unsupported"] = _ASYNC_UNSUPPORTED_NOTE
-    logger.info("background proc %s: async delivery unsupported on this "
-                "session; notify_on_complete/watch_patterns disabled", proc_session.id)
-    return False, None
+    logger.info("background spawn: async delivery unsupported on this session; "
+                "notify_on_complete/watch_patterns disabled")
+    return {}, None
 
 
 def _register_completion_watcher(process_registry, proc_session, session_key) -> None:
@@ -145,14 +197,33 @@ def spawn_background_process(
     effective_cwd = _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
     )
+    result_data = {"output": "Background process started", "exit_code": 0, "error": None}
+    try:
+        # Resolve the completion contract BEFORE spawning: an unsupported finite API run must
+        # fail with no PID and no process entry, not with a detached promise nobody can keep.
+        session_fields, watch_patterns = _resolve_completion_support(
+            notify_on_complete, watch_patterns, result_data)
+    except _UnsupportedCompletion:
+        logger.warning("Refusing a detached notify-on-complete spawn: this API session has no "
+                       "durable completion route")
+        return json.dumps({"output": "", "exit_code": -1, "error": _API_DURABLE_UNSUPPORTED_ERROR},
+                          ensure_ascii=False)
+    notify_on_complete = bool(session_fields.get("notify_on_complete"))
+    watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+        notify_on_complete=notify_on_complete, watch_patterns=watch_patterns, background=True,
+    )
+    if conflict_note:
+        logger.warning("background spawn: %s", conflict_note)
+        result_data["watch_patterns_ignored"] = conflict_note
+    if watch_patterns:
+        session_fields["watch_patterns"] = list(watch_patterns)
     try:
         proc_session = _spawn(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
-            effective_pty=effective_pty,
+            effective_pty=effective_pty, session_fields=session_fields,
         )
-        result_data = {"output": "Background process started", "session_id": proc_session.id,
-                       "pid": proc_session.pid, "exit_code": 0, "error": None}
+        result_data.update(session_id=proc_session.id, pid=proc_session.pid)
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:
@@ -163,26 +234,17 @@ def spawn_background_process(
             existing = result_data.get("hint", "")
             result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
                                    else _HOMEBREW_CI_POLLER_HINT)
-
-        notify_on_complete, watch_patterns = _apply_async_support(
-            proc_session, result_data, notify_on_complete, watch_patterns)
-        watch_patterns, conflict_note = _resolve_notification_flag_conflict(
-            notify_on_complete=bool(notify_on_complete), watch_patterns=watch_patterns, background=True,
-        )
-        if conflict_note:
-            logger.warning("background proc %s: %s", proc_session.id, conflict_note)
-            result_data["watch_patterns_ignored"] = conflict_note
         if notify_on_complete:
-            proc_session.notify_on_complete = True
             result_data["notify_on_complete"] = True
-            if proc_session.watcher_platform:
+            # A durable route owns its own delivery (the outbox claim is the single arbiter);
+            # registering a gateway watcher too would deliver the same completion twice.
+            if proc_session.watcher_platform and not proc_session.completion_delivery:
                 _register_completion_watcher(process_registry, proc_session, session_key)
             from agent.delegation_context import is_delegated_child_context
             if is_delegated_child_context():
                 result_data["notify_on_complete"] = False
                 result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
         if watch_patterns:
-            proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:

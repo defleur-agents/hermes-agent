@@ -10,6 +10,30 @@ from agent.redact import redact_sensitive_text
 logger = logging.getLogger("tools.process_registry")
 
 
+def _record_unrecoverable_completion(entry: Dict[str, Any]) -> None:
+    """A checkpointed worker we cannot re-adopt still owes its session an answer.
+
+    Promoting its armed receipt to a PENDING unknown-outcome completion is the difference between
+    "your background job died with the last gateway" and silence. No-op for entries without a
+    durable route (an armed receipt is the only thing this can promote).
+    """
+    if not entry.get("completion_delivery"):
+        return
+    try:
+        from tools.process_registry_outbox import record_lost
+        # A worker in its own systemd scope could have outlived the gateway; finding it gone means
+        # shutdown reaped the scope. One sharing the gateway cgroup simply died with it — say which,
+        # because that is the difference between "we stopped your job" and "your job vanished".
+        reason = "killed" if entry.get("survive_gateway_restart") else "lost"
+        if record_lost(entry, reason=reason):
+            logger.warning(
+                "Background process %s could not be recovered after restart; its completion is "
+                "queued for delivery with an unknown outcome.", entry.get("session_id", "?"))
+    except Exception:
+        logger.warning("Could not record a lost completion for %s",
+                       entry.get("session_id", "?"), exc_info=True)
+
+
 class ProcessCheckpointMixin:
     # ----- Checkpoint (crash recovery) -----
 
@@ -74,6 +98,7 @@ class ProcessCheckpointMixin:
                 logger.info(
                     "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
                     entry.get("command", "unknown")[:60], pid, pid_scope)
+                _record_unrecoverable_completion(entry)
                 continue
             # Alive AND the same process: across a restart the kernel may have
             # recycled the PID onto a stranger, and adopting it would let a later
@@ -92,6 +117,7 @@ class ProcessCheckpointMixin:
                         "retaining checkpoint entry for the next startup",
                         systemd_unit, pid)
                     unresolved_scope_entries.append(entry)
+                _record_unrecoverable_completion(entry)
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             fields.update(

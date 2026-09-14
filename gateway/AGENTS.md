@@ -75,6 +75,31 @@ acceptance. Refused admission refunds every claimed batch sibling without spendi
 actual delivery errors keep their bounded retry policy. Recognized raw API routes resolve after
 persisted messaging origins and defer quietly when unavailable; malformed routes still warn.
 
+### Durable completions on finite API/Wizard runs
+
+A `/v1/runs` turn ends with its HTTP response, so a detached `notify_on_complete` worker it spawned
+has no live parent. `session_context.completion_delivery_mode()` declares the durable route home;
+`APIServerAdapter` binds `api_session_wake` only for an authenticated session whose history the
+server owns and can resume (same #98619 audit as `session_history_delivery`), and advertises it as
+the `background_process_completion` capability. The terminal tool validates that route BEFORE
+spawning: with no route an API run is refused outright (no PID, no process entry) rather than
+handed a promise nothing can keep; other finite surfaces (one-shot CLI, cron, Kanban) keep their
+"poll it yourself" downgrade. Watch-pattern streaming is not available on this route.
+
+An armed spawn writes its route into the first checkpoint AND the first receipt
+(`tools/process_registry_outbox.py`, receipt schema 2), so an immediate exit cannot produce a
+routeless completion; the exit settles it to `pending` before the session leaves the running set.
+The `APIServerAdapter` owns the replay loop (started from `connect()`, so a standalone
+`wizard-api.service` works without a GatewayRunner): it claims only its own receipts, reconciles
+armed receipts whose worker is gone into pending unknown outcomes, formats with
+`format_process_notification()` and self-posts through `gateway.wake` with a per-completion
+`Idempotency-Key`, settling only after accepted delivery. The outbox claim is the SINGLE arbiter —
+a durable-route completion is deliberately not queued on `completion_queue` and registers no
+gateway watcher. `wait`/`log`/explicit kill settle it `consumed` so no replay repeats a result the
+turn already read. Schema-1 receipts never replay. Route resolution prefers `origin_session_id`,
+then the API `chat_id`, and only then `session_key` — on `/v1/runs` the session key is the per-run
+approval id and resumes no conversation.
+
 Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
 reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,
 or opted-in explicit targets. `all` expansions do not gain home mirror eligibility. Mirrored

@@ -27,6 +27,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Leaf module (stdlib only) — safe to import before the gateway package's heavier imports below.
+from gateway.session_context import COMPLETION_DELIVERY_API_SESSION_WAKE
+
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
@@ -73,7 +76,14 @@ _STATIC_FEATURE_FLAGS = {
     "skills_api": True, "audio_api": False, "realtime_voice": False,
  "session_continuity_header": "X-Hermes-Session-Id",
  "session_key_header": "X-Hermes-Session-Key",
- "delegation_delivery": {"supported": True, "modes": ["background", "join"], "default": "background"}}
+ "delegation_delivery": {"supported": True, "modes": ["background", "join"], "default": "background"},
+ # A background terminal process on a resumable API session gets its completion delivered as a
+ # NEW turn on the same session id, even if the run that spawned it (and the process that served
+ # it) is long gone. Clients learn from this whether a detached worker will ever report back.
+ "background_process_completion": {
+     "supported": True, "mode": COMPLETION_DELIVERY_API_SESSION_WAKE,
+     "requires": ["authenticated_session", "server_owned_history"],
+     "delivery": "session_wake_turn", "watch_patterns": False}}
 # /v1/capabilities "endpoints" table: name -> (method, path).
 _CAPABILITY_ENDPOINTS = (
     ("health", ("GET", "/health")), ("health_detailed", ("GET", "/health/detailed")),
@@ -3611,15 +3621,32 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 code="rate_limit_exceeded", headers={"Retry-After": "1"})
         return None
 
+    def _completion_delivery_mode(self, *, chat_id: str, session_history_delivery: str) -> str:
+        """The durable route a post-turn completion may take home on THIS request, or "".
+
+        Three conditions, all load-bearing: the session id must be one the server can resume
+        (``session_history_delivery``, the #98619 audit), there must BE an id to resume, and the
+        wake self-post must be able to authenticate — session continuation is 403-gated on
+        ``API_SERVER_KEY``, so without a key the wake would land in a fresh session nobody reads.
+        """
+        if session_history_delivery != "1" or not chat_id or not self._api_key:
+            return ""
+        return COMPLETION_DELIVERY_API_SESSION_WAKE
+
     @staticmethod
     def _bind_api_server_session(
         *, chat_id: str = "", session_key: str = "", session_id: str = "", profile: str = "",
         browser_control_principal: str = "", browser_control_transport_family: str = "",
-        session_history_delivery: str = "", delegation_delivery: str = "background") -> list:
+        session_history_delivery: str = "", delegation_delivery: str = "background",
+        completion_delivery: str = "") -> list:
         """Bind an API turn with push disabled and history delivery default-denied.
 
         Only routes whose continuation reads SessionDB may pass "1". An omitted
         declaration or fingerprint-derived identity keeps delegation synchronous.
+
+        ``completion_delivery`` is the resolved durable route (see ``_completion_delivery_mode``);
+        push stays disabled either way — this grants a background completion a way home, not the
+        adapter a way to push.
 
         ``profile`` is the ``/p/<profile>/`` prefix serving the request (``""`` = default). It must
         reach ``HERMES_SESSION_PROFILE``: the persistent-Docker container key is derived from it, so an
@@ -3630,7 +3657,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             profile=profile, browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False, cron_session="", session_history_delivery=session_history_delivery,
-            delegation_delivery=delegation_delivery)
+            delegation_delivery=delegation_delivery, completion_delivery=completion_delivery)
 
     def _turn_runtime_metadata(
         self, agent: Any, *, route: Optional[Dict[str, Any]], requested_runtime: Optional[Dict[str, Any]],
@@ -3730,7 +3757,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     session_id=session_id or "", profile=request_profile or "",
                     browser_control_principal=request_browser_control_principal,
                     browser_control_transport_family=request_browser_control_transport_family,
-                    session_history_delivery=session_history_delivery)
+                    session_history_delivery=session_history_delivery,
+                    completion_delivery=self._completion_delivery_mode(
+                        chat_id=session_id or "", session_history_delivery=session_history_delivery))
                 agent = None
                 try:
                     agent = self._create_agent(
@@ -3953,6 +3982,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
             self._track_background_task(asyncio.create_task(self._sweep_orphaned_runs()))
+            # Owned by the ADAPTER, not the GatewayRunner: a standalone wizard-api.service has no
+            # runner, and its finite runs are exactly the ones whose background workers outlive
+            # the turn that spawned them.
+            from gateway.platforms.api_server_completions import completion_replay_loop
+            self._track_background_task(asyncio.create_task(completion_replay_loop(self)))
             # Network-accessible + unsandboxed local terminal backend = host-user RCE surface;
             # warn, don't refuse (the operator may have a firewall / strong key).
             if is_network_accessible(self._host):

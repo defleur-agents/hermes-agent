@@ -61,6 +61,18 @@ _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", defaul
 # originating parent can inspect, recover, integrate, and verify before final.
 _SESSION_DELEGATION_DELIVERY = ContextVar("HERMES_SESSION_DELEGATION_DELIVERY", default=_UNSET)
 
+# How a completion produced AFTER this turn ends can still reach this conversation.  Distinct
+# from ``_SESSION_ASYNC_DELIVERY``, which answers the different question "can the adapter PUSH
+# to the user" (stateless API sessions answer no, and that stays no).  This one answers "is there
+# a durable server-side route that can resume the exact originating session later".
+_SESSION_COMPLETION_DELIVERY = ContextVar("HERMES_SESSION_COMPLETION_DELIVERY", default=_UNSET)
+
+COMPLETION_DELIVERY_NONE = ""
+# Authenticated API session with server-owned history: the gateway/adapter re-enters the SAME
+# session id with a new turn. Bound only where the session id is one the server can resume.
+COMPLETION_DELIVERY_API_SESSION_WAKE = "api_session_wake"
+_COMPLETION_DELIVERY_MODES = frozenset({COMPLETION_DELIVERY_NONE, COMPLETION_DELIVERY_API_SESSION_WAKE})
+
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
@@ -125,6 +137,7 @@ def set_session_vars(
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None, delegation_delivery: str = "background",
+    completion_delivery: str = COMPLETION_DELIVERY_NONE,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -134,7 +147,10 @@ def set_session_vars(
     ``"1"`` (audited producers — explicit session-id header, native API sessions, /v1/runs) or
     ``""`` / omitted (default-deny, #98619).  ``None`` leaves the var at ``_UNSET`` ("never
     declared"), which ``session_history_delivery_supported()`` treats as NOT capable — an omitted declaration
-    cannot grant wake authority."""
+    cannot grant wake authority.
+
+    ``completion_delivery`` declares the durable route a post-turn completion may take home; an
+    unknown or omitted value fails closed to "no route" (see :func:`completion_delivery_mode`)."""
     global _session_context_engaged
     _session_context_engaged = True
     values = (
@@ -146,6 +162,7 @@ def set_session_vars(
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
     tokens.append(_SESSION_DELEGATION_DELIVERY.set(delegation_delivery))
+    tokens.append(_SESSION_COMPLETION_DELIVERY.set(completion_delivery))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -161,6 +178,7 @@ def clear_session_vars(tokens: list) -> None:
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _SESSION_DELEGATION_DELIVERY.set(_UNSET)
+    _SESSION_COMPLETION_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -169,12 +187,14 @@ def reset_session_vars() -> None:
     the top of a fresh task *before* it binds: ``create_task`` snapshots the context, so B's
     task inherits A's already-set vars and a subprocess spawned before B binds would read A's
     identity.  ``_SESSION_ASYNC_DELIVERY``, ``_SESSION_HISTORY_DELIVERY``, and
-    ``_SESSION_DELEGATION_DELIVERY`` (outside ``_VAR_MAP``) are reset explicitly too."""
+    ``_SESSION_DELEGATION_DELIVERY`` and ``_SESSION_COMPLETION_DELIVERY`` (outside ``_VAR_MAP``)
+    are reset explicitly too."""
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _SESSION_DELEGATION_DELIVERY.set(_UNSET)
+    _SESSION_COMPLETION_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -230,6 +250,15 @@ def session_history_delivery_supported() -> bool:
 
     Fail closed on omitted bindings; never borrow authority from the environment."""
     return _SESSION_HISTORY_DELIVERY.get() == "1"
+
+
+def completion_delivery_mode() -> str:
+    """Durable route home for a completion produced after this turn ends; ``""`` = none.
+
+    Unknown and unbound values fail closed: an undeclared capability grants nothing.
+    """
+    value = _SESSION_COMPLETION_DELIVERY.get()
+    return value if value in _COMPLETION_DELIVERY_MODES else COMPLETION_DELIVERY_NONE
 
 
 def delegation_delivery_mode() -> str:

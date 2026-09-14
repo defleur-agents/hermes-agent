@@ -182,6 +182,37 @@ class TestAdapterCapabilityFlag:
             clear_session_vars(tokens)
         assert delegation_delivery_mode() == "background"
 
+    def test_completion_delivery_mode_requires_a_resumable_authenticated_session(self):
+        """Push stays off for every API turn; a DURABLE completion route is granted only where
+        the server both owns the history and can authenticate the wake self-post back into it.
+        Any missing leg fails closed to "no route" rather than to a wake nobody reads."""
+        from types import SimpleNamespace
+
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.session_context import (
+            clear_session_vars, completion_delivery_mode)
+
+        resolve = APIServerAdapter._completion_delivery_mode
+        keyed, keyless = SimpleNamespace(_api_key="k"), SimpleNamespace(_api_key="")
+        assert resolve(keyed, chat_id="sid", session_history_delivery="1") == "api_session_wake"
+        # previous_response_id / caller-supplied history: no SessionDB continuation to resume.
+        assert resolve(keyed, chat_id="sid", session_history_delivery="") == ""
+        # Nothing to address.
+        assert resolve(keyed, chat_id="", session_history_delivery="1") == ""
+        # Session continuation is 403-gated on API_SERVER_KEY: an unauthenticated wake would
+        # land in a fresh session nobody reads.
+        assert resolve(keyless, chat_id="sid", session_history_delivery="1") == ""
+
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id="sid", session_key="run_1", session_id="sid",
+            session_history_delivery="1", completion_delivery="api_session_wake")
+        try:
+            assert async_delivery_supported() is False, "a durable route is not a push channel"
+            assert completion_delivery_mode() == "api_session_wake"
+        finally:
+            clear_session_vars(tokens)
+        assert completion_delivery_mode() == ""
+
 
 # ---------------------------------------------------------------------------
 # terminal_tool: refuses to register a watcher on unsupported sessions
@@ -203,7 +234,14 @@ class TestTerminalNotifyGate:
             terminal_tool(command=command, background=True, notify_on_complete=True)
         )
 
-    def test_api_server_skips_watcher_and_notes(self):
+    def test_api_server_without_durable_route_refuses_the_spawn(self):
+        """Changed deliberately: this used to start the process and downgrade the flag to
+        "poll it yourself". On a finite API run there is nothing left to poll WITH — the turn
+        ends with the HTTP response — so the detached worker became the "Executing now" failure:
+        it ran on, failed, and no completion ever resumed the session. With no durable route the
+        spawn is now refused outright, leaving no PID and no process entry for a promise nothing
+        could keep. Non-API finite surfaces (one-shot CLI, cron, Kanban) keep the old downgrade;
+        see tests/tools/test_notify_on_complete.py."""
         from tools.process_registry import process_registry
 
         tokens = set_session_vars(
@@ -214,9 +252,30 @@ class TestTerminalNotifyGate:
         finally:
             clear_session_vars(tokens)
 
-        assert d.get("notify_on_complete") is False
-        assert d.get("notify_unsupported"), "must explain the limitation"
-        assert "poll" in d["notify_unsupported"].lower()
+        assert d["exit_code"] == -1
+        assert "session_id" not in d and "pid" not in d
+        assert "background=false" in d["error"], "must name the corrective shape"
         assert len(process_registry.pending_watchers) == 0
+
+    def test_api_server_with_durable_route_arms_instead_of_watching(self):
+        """A resumable API session spawns normally and carries the durable route home; the
+        gateway watcher stays unregistered because the outbox claim is the single arbiter."""
+        from tools.process_registry import process_registry
+
+        tokens = set_session_vars(
+            platform="api_server", chat_id="s1", session_key="run_1", async_delivery=False,
+            session_history_delivery="1", completion_delivery="api_session_wake")
+        try:
+            d = self._run_bg("sleep 30 && echo DONE")
+        finally:
+            clear_session_vars(tokens)
+        try:
+            assert d.get("notify_on_complete") is True
+            session = process_registry.get(d["session_id"])
+            assert session.completion_delivery == "api_session_wake"
+            assert session.watcher_chat_id == "s1"
+            assert len(process_registry.pending_watchers) == 0
+        finally:
+            process_registry.kill_process(d["session_id"], consume_output=False)
 
 

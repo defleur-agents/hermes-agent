@@ -296,9 +296,12 @@ def _silent_bg_base_config(tmp_path):
     }
 
 
-def _silent_bg_harness(monkeypatch, tmp_path):
+def _silent_bg_harness(monkeypatch, tmp_path, spawns=None):
     """Common test fixture: patch enough of terminal_tool to spawn a fake
-    background process and capture the JSON result the agent sees."""
+    background process and capture the JSON result the agent sees.
+
+    ``spawns`` (optional list) records every spawn call's kwargs, so a test can assert what the
+    registry would have been told — and that an refused spawn recorded nothing at all."""
     import tools.terminal_tool as terminal_tool_module
     from tools import process_registry as process_registry_module
     from types import SimpleNamespace
@@ -307,17 +310,24 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     dummy_env = SimpleNamespace(env={})
 
     def fake_spawn_local(**kwargs):
+        if spawns is not None:
+            spawns.append(kwargs)
+        fields = dict(kwargs.get("session_fields") or {})
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
-            notify_on_complete=False,
-            watcher_platform="",
-            watcher_chat_id="",
+            notify_on_complete=fields.get("notify_on_complete", False),
+            completion_delivery=fields.get("completion_delivery", ""),
+            delivery_adapter_id=fields.get("delivery_adapter_id", ""),
+            watch_patterns=fields.get("watch_patterns", []),
+            watcher_platform=fields.get("watcher_platform", ""),
+            watcher_chat_id=fields.get("watcher_chat_id", ""),
             watcher_user_id="",
             watcher_user_name="",
             watcher_thread_id="",
             watcher_message_id="",
             watcher_interval=0,
+            parent_session_id="",
         )
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
@@ -441,3 +451,115 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
     assert "hint" not in result, (
         f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Durable completion contract on finite API/Wizard runs
+#
+# A /v1/runs turn ENDS when its HTTP response is written. A detached
+# notify_on_complete worker spawned inside it therefore has no live parent: the
+# production incident was a Wizard turn answering "Executing now", the worker
+# failing after the run ended, and nothing ever resuming that Wizard session.
+# The contract is now resolved BEFORE the spawn — a session with a durable route
+# arms the outbox, one without it never gets a PID.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _pristine_session_context():
+    """Restore ContextVars to "never bound" so a bound API identity cannot leak."""
+    import gateway.session_context as sc
+
+    yield sc
+    for var in sc._VAR_MAP.values():
+        var.set(sc._UNSET)
+    for var in (sc._SESSION_ASYNC_DELIVERY, sc._SESSION_HISTORY_DELIVERY,
+                sc._SESSION_DELEGATION_DELIVERY, sc._SESSION_COMPLETION_DELIVERY):
+        var.set(sc._UNSET)
+
+
+def _bind_api_run(sc, *, completion_delivery, chat_id="wizard-session-9", session_key="run_abc123"):
+    """Bind what a /v1/runs turn binds: chat_id is the resumable Wizard session, session_key is
+    the per-run approval id (isolated per run — it resumes no conversation)."""
+    sc.set_session_vars(
+        platform="api_server", chat_id=chat_id, session_key=session_key, session_id=chat_id,
+        async_delivery=False, session_history_delivery="1" if completion_delivery else "",
+        completion_delivery=completion_delivery)
+
+
+class TestFiniteApiCompletionContract:
+    def test_unsupported_api_run_refuses_to_spawn(self, monkeypatch, tmp_path, _pristine_session_context):
+        """No durable route -> no process at all: no PID, no session id, nothing registered."""
+        spawns = []
+        tt = _silent_bg_harness(monkeypatch, tmp_path, spawns)
+        _bind_api_run(_pristine_session_context, completion_delivery="")
+        try:
+            result = json.loads(tt.terminal_tool(
+                command="./deploy.sh", background=True, notify_on_complete=True))
+        finally:
+            tt._active_environments.pop("default", None)
+            tt._last_activity.pop("default", None)
+
+        assert spawns == [], "the spawn must be refused before any process exists"
+        assert result["exit_code"] == -1
+        assert "pid" not in result and "session_id" not in result
+        assert "background=false" in result["error"], result["error"]
+
+    def test_supported_api_run_arms_the_raw_resumable_destination(
+            self, monkeypatch, tmp_path, _pristine_session_context):
+        """The durable route is armed at spawn time and addressed to the Wizard session id —
+        never the per-run session_key, which resumes no conversation."""
+        spawns = []
+        tt = _silent_bg_harness(monkeypatch, tmp_path, spawns)
+        _bind_api_run(_pristine_session_context, completion_delivery="api_session_wake")
+        try:
+            result = json.loads(tt.terminal_tool(
+                command="pytest tests/", background=True, notify_on_complete=True))
+        finally:
+            tt._active_environments.pop("default", None)
+            tt._last_activity.pop("default", None)
+
+        assert result["notify_on_complete"] is True
+        fields = spawns[0]["session_fields"]
+        assert fields["completion_delivery"] == "api_session_wake"
+        assert fields["delivery_adapter_id"] == "api_server"
+        assert fields["watcher_chat_id"] == "wizard-session-9"
+        assert "run_abc123" not in fields.values()
+
+    def test_api_wake_drops_watch_patterns_but_keeps_the_process(
+            self, monkeypatch, tmp_path, _pristine_session_context):
+        """Watch-pattern streaming needs a turn per match; the durable route grants one, for
+        the terminal outcome. The process still runs."""
+        spawns = []
+        tt = _silent_bg_harness(monkeypatch, tmp_path, spawns)
+        _bind_api_run(_pristine_session_context, completion_delivery="api_session_wake")
+        try:
+            result = json.loads(tt.terminal_tool(
+                command="tail -f build.log", background=True, watch_patterns=["BUILD FAILED"]))
+        finally:
+            tt._active_environments.pop("default", None)
+            tt._last_activity.pop("default", None)
+
+        assert result["session_id"] == "proc_silent_test"
+        assert "watch_patterns" not in result
+        assert "watch_patterns_unsupported" in result
+
+    def test_non_api_finite_surface_keeps_the_degrade_note(
+            self, monkeypatch, tmp_path, _pristine_session_context):
+        """A one-shot CLI / cron / Kanban worker still degrades to poll-yourself rather than
+        failing the spawn — that behavior predates the durable route and stays."""
+        spawns = []
+        tt = _silent_bg_harness(monkeypatch, tmp_path, spawns)
+        _pristine_session_context.set_session_vars(
+            platform="", source="cli", chat_id="", session_key="", session_id="",
+            async_delivery=False)
+        try:
+            result = json.loads(tt.terminal_tool(
+                command="make release", background=True, notify_on_complete=True))
+        finally:
+            tt._active_environments.pop("default", None)
+            tt._last_activity.pop("default", None)
+
+        assert spawns, "a non-API finite surface still gets its background process"
+        assert result["notify_on_complete"] is False
+        assert "notify_unsupported" in result

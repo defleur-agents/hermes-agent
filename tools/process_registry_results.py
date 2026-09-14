@@ -1,8 +1,10 @@
 """Bounded, profile-local receipts for completed terminal processes.
 
-Receipts are read through process_manage, never replayed as notifications or
-adopted as live PIDs. Each producer writes its own file so independent one-shot
-parents cannot overwrite each other's results in the running-PID checkpoint.
+Receipts are read through process_manage and never adopted as live PIDs. A receipt carrying a
+durable ``completion`` block (schema 2) is additionally an outbox row — see
+``tools.process_registry_outbox`` for the delivery state machine. Each producer writes its own
+file so independent one-shot parents cannot overwrite each other's results in the running-PID
+checkpoint.
 """
 
 import json
@@ -11,8 +13,7 @@ import re
 import sqlite3
 import time
 
-from hermes_constants import get_hermes_home
-from utils import atomic_json_write
+from tools import process_registry_outbox as outbox
 
 logger = logging.getLogger("tools.process_registry")
 
@@ -25,27 +26,47 @@ _RESULT_FIELDS = (
 )
 
 
-def _result_paths():
-    """Prune by completion time, not start time (jobs can take days)."""
-    directory = get_hermes_home() / "logs" / "process-results"
+def _drop(path) -> None:
+    path.unlink(missing_ok=True)
+    path.with_suffix(".lock").unlink(missing_ok=True)
+
+
+def retained_result_paths():
+    """Prune settled receipts by completion time (jobs can take days), newest first.
+
+    A completion that still owes a delivery is immune to the count cap — pruning it is exactly
+    the silent loss the outbox exists to prevent — but not immortal: past the retention window
+    nobody is waiting on it, and immunity without a bound would grow the directory forever.
+    """
+    directory = outbox.results_dir()
     cutoff = time.time() - RESULT_RETENTION_SECONDS
     retained = []
     for path in directory.glob("proc_*.json"):
         try:
             modified = path.stat().st_mtime
             if modified < cutoff:
-                path.unlink(missing_ok=True)
+                _drop(path)
             else:
                 retained.append((modified, path))
         except FileNotFoundError:
             continue  # Another producer pruned it.
     retained.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    kept_over_cap = []
     for _, path in retained[MAX_RETAINED_RESULTS:]:
-        path.unlink(missing_ok=True)
-    return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
+        if outbox.is_unsettled(outbox.read_receipt(path)):
+            kept_over_cap.append(path)
+        else:
+            _drop(path)
+    return [path for _, path in retained[:MAX_RETAINED_RESULTS]] + kept_over_cap
 
 
-def save_completed_result(session) -> None:
+def save_completed_result(session, *, notification=None, consumed: bool = False) -> None:
+    """Persist the terminal receipt for *session*.
+
+    For an armed process this is the transition that makes its completion ``pending``: it runs
+    while the session is still tracked as running, so no consumer can observe "finished, no
+    receipt". ``notification`` is the completion_queue event the delivery replays verbatim.
+    """
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
@@ -55,11 +76,21 @@ def save_completed_result(session) -> None:
     # Live-output opt-out must not persist raw credentials in durable receipts.
     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
     record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
-    directory = get_hermes_home() / "logs" / "process-results"
     try:
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        atomic_json_write(directory / f"{session.id}.json", record, mode=0o600)
-        _result_paths()
+        if not session.completion_delivery:
+            outbox.write_receipt(record)
+        else:
+            with outbox.receipt_lock(session.id) as held:
+                if not held:
+                    # Writing without the lock could clobber a concurrent consumer's claim; the
+                    # completion is lost rather than duplicated, and the result stays in memory.
+                    logger.error("Could not settle durable completion %s: receipt lock busy — its "
+                                 "delivery will not be replayed", session.id)
+                    return
+                previous = outbox.read_receipt(outbox.receipt_path(session.id))
+                outbox.write_receipt(outbox.attach_outcome(
+                    record, previous, session=session, event=notification, consumed=consumed))
+        retained_result_paths()
     except OSError:
         # Preserve live delivery on disk failure, but never silently claim durability.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
@@ -90,7 +121,7 @@ def load_completed_results(prefix: str = "") -> dict:
         return {}
     results = {}
     try:
-        paths = _result_paths()
+        paths = retained_result_paths()
     except OSError:
         logger.warning("Could not read retained process results", exc_info=True)
         return results
@@ -100,6 +131,10 @@ def load_completed_results(prefix: str = "") -> dict:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             if record["id"] != path.stem or not re.fullmatch(r"proc_[\w]+", record["id"]):
+                continue
+            # An armed receipt describes a process that is still RUNNING; only legacy receipts
+            # (no flag) and terminal ones are restorable results.
+            if not record.get("exited", True):
                 continue
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue

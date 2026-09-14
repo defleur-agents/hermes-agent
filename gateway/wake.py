@@ -51,11 +51,14 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
         raise WakeNotAccepted("internal wake not accepted by adapter")
 
 
-async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None) -> None:
+async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
+                       idempotency_key: str = "") -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
-    ``SessionSource`` for the synthetic event — required for push-capable adapters. Raises on
-    failure so the caller can rewind/retry."""
+    ``SessionSource`` for the synthetic event — required for push-capable adapters.
+    ``idempotency_key`` rides the self-post as the ``Idempotency-Key`` header: a durable producer
+    that retries after an accepted-but-unacknowledged delivery replays the stored response instead
+    of running the turn a second time. Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
@@ -66,7 +69,10 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     if not session_id:
         raise ValueError("deliver_wake: non-push adapter (supports_async_delivery=False) "
                          "requires the raw session id to self-post the wake turn")
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    # Passed only when a producer actually has a stable key, so the ordinary wake keeps today's
+    # call shape (and no self-post starts carrying an empty header).
+    extra = {"idempotency_key": idempotency_key} if idempotency_key else {}
+    await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
 def _delegation_display_metadata(evt: dict) -> dict:
@@ -132,7 +138,8 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
     )
 
 
-async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str) -> None:
+async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
+                                     idempotency_key: str = "") -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
     own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
     ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
@@ -151,6 +158,8 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
         host = f"[{host}]"  # bare IPv6 literal
     url = f"http://{host}:{port}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
     payload = {"model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
                "messages": [{"role": "user", "content": text}], "stream": False}
     last_err: Optional[BaseException] = None

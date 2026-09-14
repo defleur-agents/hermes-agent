@@ -41,14 +41,21 @@ _DURABLE_CLAIM_OPS = {
 
 
 def _raw_process_event_session_id(evt: dict) -> str:
-    """Recognize API routes, not malformed structured or partial messaging routes."""
+    """Recognize API routes, not malformed structured or partial messaging routes.
+
+    Preference order is deliberate: the producer-captured ``origin_session_id``, then the bound API
+    ``chat_id``, and only then ``session_key``. On ``/v1/runs`` the session key is the run/approval
+    id — isolated per run on purpose — so resuming it would open a parallel session nobody reads
+    instead of the conversation that spawned the work.
+    """
     session_key = str(evt.get("session_key") or "").strip()
     platform = str(evt.get("platform") or "").strip().lower()
     if session_key.startswith("agent:") or platform not in {"", "api_server"}:
         return ""
     if not platform and any(evt.get(field) for field in ("chat_id", "chat_type", "thread_id")):
         return ""
-    return str(evt.get("origin_session_id") or session_key or "").strip()
+    chat_id = str(evt.get("chat_id") or "").strip() if platform == "api_server" else ""
+    return str(evt.get("origin_session_id") or chat_id or session_key or "").strip()
 
 
 class GatewayNotificationsMixin:

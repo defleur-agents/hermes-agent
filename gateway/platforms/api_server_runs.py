@@ -558,7 +558,13 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 # likewise a caller-supplied conversation_history is authoritative for the
                 # turn and never reads the delivery row, so it is denied the same way.
                 session_history_delivery="1" if run.session_history_delivery else "",
-                delegation_delivery=run.delegation_delivery)
+                delegation_delivery=run.delegation_delivery,
+                # A finite run ends with its HTTP response; a background worker it spawns can only
+                # report back through the durable session-wake route, and only when this session id
+                # is one the server can resume. Same audit as session_history_delivery above.
+                completion_delivery=self._completion_delivery_mode(
+                    chat_id=session_id or "",
+                    session_history_delivery="1" if run.session_history_delivery else ""))
             if session_tokens:
                 resets.append((session_tokens, clear_session_vars))
             if run.agent_kwargs["room_dispatch"] is not None:

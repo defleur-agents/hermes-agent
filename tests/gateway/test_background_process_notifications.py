@@ -657,6 +657,40 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+async def test_inject_watch_notification_prefers_api_chat_id_over_run_session_key(
+    monkeypatch, tmp_path,
+):
+    """A /v1/runs turn binds session_key = the per-run approval id, which is isolated per run
+    and resumes NO conversation. Waking it opens a parallel session nobody reads while the
+    Wizard session that spawned the work hears nothing — the bound API chat_id is the real
+    destination and must win."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AdmittingHandler(),
+        _host="127.0.0.1", _port=8642, _api_key="k", _model_name="m",
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append(session_id)
+
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+
+    evt = {
+        "session_id": "proc_finisher",
+        "platform": "api_server",
+        "session_key": "run_0f0f0f0f",  # per-run approval id, not a conversation
+        "chat_id": "wizard-session-42",
+    }
+    assert await runner._inject_watch_notification("[SYSTEM: done]", evt) is True
+    assert posts == ["wizard-session-42"]
+
+
+@pytest.mark.asyncio
 async def test_async_delegation_apiserver_persists_delivery_not_self_post(
     monkeypatch, tmp_path,
 ):

@@ -457,6 +457,15 @@ class ProcessSession:
     # session was closed at a user boundary (/new) instead of injecting into the NEW one.
     parent_session_id: str = ""
     notify_on_complete: bool = False            # Queue agent notification on exit
+    # Durable completion routing (tools/process_registry_outbox.py). ``completion_delivery`` is the
+    # session-context mode that authorized this spawn ("" = no durable route, live watchers only);
+    # ``delivery_adapter_id`` names the surface whose replay loop owns the receipt.
+    completion_delivery: str = ""
+    delivery_adapter_id: str = ""
+    # Whether this worker owns a private systemd scope and could genuinely outlive the gateway.
+    # Shutdown still kills it (see the outbox module's documented limitation); recovery uses the
+    # flag to tell a restart survivor from a worker that shared the gateway's cgroup.
+    survive_gateway_restart: bool = False
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
     _watch_suppressed: int = field(default=0, repr=False)    # matches dropped by rate limit
@@ -496,7 +505,8 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "watch_patterns")
+    "parent_session_id", "notify_on_complete", "watch_patterns",
+    "completion_delivery", "delivery_adapter_id", "survive_gateway_restart")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -857,14 +867,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
     # ----- Spawn -----
 
     @staticmethod
-    def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
+    def _new_session(command, task_id, owner_task_id, session_key, cwd, session_fields=None,
+                     **extra) -> ProcessSession:
+        """Build the session. ``session_fields`` carries notification/routing metadata the caller
+        already resolved; it is applied at CONSTRUCTION so the first checkpoint and the first
+        receipt both carry the route — an immediately-exiting child cannot win that race."""
         from gateway.session_context import get_session_env
 
+        fields = {"parent_session_id": get_session_env("HERMES_SESSION_ID", ""),
+                  **(session_fields or {}), **extra}
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
             owner_task_id=owner_task_id or task_id, session_key=session_key, cwd=cwd,
-            parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
-            started_at=time.time(), **extra)
+            started_at=time.time(), **fields)
 
     @staticmethod
     def _env_temp_dir(env: Any) -> str:
@@ -914,6 +929,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         reader = threading.Thread(target=copy_context().run, args=(reader_target, session, *extra_args),
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
+        # Arm the durable receipt before the reader exists, so an instant-exit child cannot
+        # settle a completion whose route metadata is not yet on disk. Deliberately outside
+        # the registry lock: it takes a cross-process receipt lock and does file I/O.
+        self._arm_durable_completion(session)
         with self._lock:
             self._prune_if_needed()
             # Completion takes this lock too. Starting here also leaves no
@@ -921,6 +940,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
             reader.start()
             self._running[session.id] = session
         self._write_checkpoint()
+
+    def _arm_durable_completion(self, session: ProcessSession) -> None:
+        """Write the ``armed`` outbox receipt for a session that declared a durable route."""
+        if not session.completion_delivery:
+            return
+        from agent.redact import redact_sensitive_text
+        from tools.process_registry_outbox import arm
+        from tools.process_registry_results import _RESULT_FIELDS
+
+        with suppress(Exception):
+            session.survive_gateway_restart = bool(session.systemd_unit)
+            base = {key: getattr(session, key) for key in _RESULT_FIELDS} | {"output": ""}
+            base["command"] = redact_sensitive_text(session.command, code_file=True, force=True)
+            arm(session, base)
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
@@ -947,10 +980,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "") -> ProcessSession:
+        env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
+        session_fields: dict = None) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
-        for interactive CLIs, falling back to a plain pipe when unavailable or failing."""
+        for interactive CLIs, falling back to a plain pipe when unavailable or failing.
+        ``session_fields`` pre-binds notification/routing metadata (see ``_new_session``)."""
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds our stdout
         # pipe open forever when B is a long-running server. The rewriter turns it into
         # ``A && { B & }``. Lazy import: terminal_tool imports this module.
@@ -958,7 +993,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
-        session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()))
+        session = self._new_session(command, task_id, owner_task_id, session_key,
+                                    _resolve_safe_cwd(cwd or os.getcwd()), session_fields)
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1045,12 +1081,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
 
     def spawn_via_env(
         self, env: Any, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
-        timeout: int = 10, owner_task_id: str = "") -> ProcessSession:
+        timeout: int = 10, owner_task_id: str = "", session_fields: dict = None) -> ProcessSession:
         """Spawn a background process inside a non-local backend's sandbox.
         The command is wrapped to capture its in-sandbox PID and redirect output to a
         log file that later execute() calls poll. No live pipe or stdin, but it runs in
         the correct sandbox context."""
-        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox")
+        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, session_fields,
+                                    env_ref=env, pid_scope="sandbox")
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
@@ -1304,33 +1341,50 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Move a session from running to finished.
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates."""
+        notification = self._completion_event_payload(session) if session.notify_on_complete else None
         with self._lock:
             was_running = session.id in self._running
             if was_running:
-                # Keep the session tracked until its result is durable. A finite
+                # Keep the session tracked until its result is durable, and settle the durable
+                # completion to ``pending`` BEFORE the session leaves the running set — a finite
                 # parent must not observe completion and exit during this write.
-                save_completed_result(session)
+                save_completed_result(session, notification=notification,
+                                      consumed=session.id in self._completion_consumed)
                 self._running.pop(session.id)
             self._finished[session.id] = session
         self._write_checkpoint()
-        if was_running and session.notify_on_complete:
-            notification = {
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "task_id": session.task_id,
-                "owner_task_id": session.owner_task_id or session.task_id,
-                "command": session.command,
-                **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
-                **self._exit_fields(session),
-                "output": _output_tail(session, 2000),
-                # Stable producer identity across checkpoint recovery (unlike a
-                # consumer-observed completion timestamp).
-                "started_at": session.started_at,
-            }
-            _redact_process_result(notification)
+        # A durable route delivers from the outbox, whose exclusive claim is the single arbiter;
+        # queueing it here as well would let a live drain loop deliver the same completion twice.
+        if was_running and notification is not None and not session.completion_delivery:
             self.completion_queue.put(notification)
         session._completion_event.set()
+
+    def _completion_event_payload(self, session: ProcessSession) -> dict:
+        """The completion_queue event for an exited session; also the durable replay payload.
+
+        A durable-route session carries its raw resumable destination as ``origin_session_id``
+        (never the run/approval ``session_key``, which is per-run and matches no conversation).
+        """
+        notification = {
+            "type": "completion",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "task_id": session.task_id,
+            "owner_task_id": session.owner_task_id or session.task_id,
+            "command": session.command,
+            **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
+            **self._exit_fields(session),
+            "output": _output_tail(session, 2000),
+            # Stable producer identity across checkpoint recovery (unlike a
+            # consumer-observed completion timestamp).
+            "started_at": session.started_at,
+        }
+        if session.completion_delivery:
+            notification["platform"] = session.watcher_platform
+            notification["origin_session_id"] = session.watcher_chat_id
+            notification["parent_session_id"] = session.parent_session_id
+        _redact_process_result(notification)
+        return notification
 
     @staticmethod
     def _exit_fields(session: ProcessSession) -> dict:
@@ -1345,6 +1399,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
+
+    def _consume_completion(self, session_id: str) -> None:
+        """The owning turn has the result in hand (wait/read_log/explicit kill): suppress the
+        in-process notification AND settle any durable receipt, so no later replay wakes the
+        session a second time with a result it already read."""
+        self._completion_consumed.add(session_id)
+        with suppress(Exception):
+            from tools.process_registry_outbox import consume
+
+            consume(session_id)
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
@@ -1669,7 +1733,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             **self._status_head(session), "output": "\n".join(selected),
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
         if session.exited and observed_completion_output:
-            self._completion_consumed.add(session_id)
+            self._consume_completion(session_id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -1702,7 +1766,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             self._reconcile_local_exit(session)  # orphaned-pipe reader guard
             result = None
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self._consume_completion(session_id)
                 result = self._exit_snapshot(session, "exited")
             elif _is_interrupted():
                 result = {
@@ -1766,7 +1830,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
-                self._completion_consumed.add(session_id)
+                self._consume_completion(session_id)
             return result
         try:
             early = self._signal_kill(session, session_id, consume_output)
@@ -1781,7 +1845,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with session._lock:
                 output = _output_tail(session, 2000)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._consume_completion(session_id)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
@@ -1825,7 +1889,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     session.exit_code = None
                     output = _output_tail(session, 2000)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._consume_completion(session_id)
                 self._move_to_finished(session)
                 return {"status": "already_exited", "exit_code": session.exit_code, "output": output}
             self._terminate_host_pid(session.pid, session.host_start_time)

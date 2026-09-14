@@ -1,0 +1,19 @@
+Revise commit ad9b9ebeab in this same isolated Hermes worktree. An independent state-machine review returned REVISE with the following required findings. Fix every P1 and the P2, extend EXISTING test files to make each failure observable, run focused tests plus ruff, then amend the existing commit. Do not activate, push, modify live state, touch /home/telos/.hermes/hermes-agent, or create a PR. Leave unrelated prompt files untracked.
+
+P1 1: Crashed delivery claims are never recovered. tools/process_registry_outbox.py pending_completions only returns ARMED/PENDING, so stale CLAIMED receipts are never inspected and claim TTL/attempt budget is unreachable. Add stale CLAIMED to replay eligibility after TTL and add a true crash-without-release test.
+
+P1 2: Named/multiplex profiles have no valid replay route. Adapter starts one replay task in default profile, receipts are profile-local and carry no profile identity, wake URL is unprefixed and uses the primary adapter key. Make durable records carry immutable profile identity (or equivalent), enumerate/route profile-local outboxes correctly, use /p/<profile>/v1/chat/completions with the originating profile credential/context, and test default plus named profile isolation/auth/path. Do not leak keys.
+
+P1 3: Durable arming fails open after spawn. arm() and _arm_durable_completion suppress lock/filesystem failure and _track_started returns success. A notified spawn must not be reported successful until the durable obligation is atomically written. Solve the spawn/arm ordering or terminate/refuse the spawned process and fail the tool call if arming fails. Test lock/write failure and no orphan process/no success receipt.
+
+P1 4: Duplicate protection is process-local and consume races delivery. API idempotency cache is only in memory, so accepted wake then restart before settlement can replay. consume() can mark CLAIMED consumed while delivery is in flight; settle result ignored. Add restart-stable idempotency/dedup tied to receipt/session, and make consume vs claim/delivery mutually exclusive so wait/log cannot cause a second turn. Check settle result. Add concurrent/multiprocess tests.
+
+P1 5: Watch-only API request silently spawns. resumable API session + watch_patterns + notify_on_complete false strips patterns then spawns. Fail closed before spawn when requested watch semantics cannot be honored. Replace the old locking test with refusal/no-spawn.
+
+P1 6: Pruning loses pending/claimed obligations and unlinks lock files unsafely. Never age-prune unresolved ARMED/PENDING/CLAIMED receipts; terminal tombstone/drop only after exhausted budget with explicit observable failure. Never unlink a per-receipt .lock file outside its lock or in a way that permits inode-split locks. Add pruning and concurrent lock tests.
+
+P2 7: Adapter replay/orphan tasks leak on bind/start failure and disconnect. Adapter owns cancellation on listener bind failure and disconnect. Add tests.
+
+Reviewer also observed contextvar state leak when running test_completed_process_results after gateway tests; eliminate that leakage or isolate reset in existing fixtures.
+
+Preserve existing Markdown response_rendering parent commit d66117f, delegation join behavior, non-API degrade semantics, and existing tests. Keep the patch narrowly about durable API background completion. Include actual commands/results and final amended SHA.

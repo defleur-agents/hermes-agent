@@ -1,0 +1,24 @@
+Implement the durable background-completion bridge for Wizard/API finite runs in this isolated Hermes worktree. You are the builder; direct Hermes will review, test, integrate, and activate. Work only in this worktree. Do not modify /home/telos/.hermes/hermes-agent, systemd units, live state, or services. Do not push or open a PR. Start commit is d66117fd1b9a9efe4cf4d6b1cc03bcf46c2c7b06, which already includes the response_rendering Markdown capability and joined delegation.
+
+Incident to reproduce: a Wizard /v1/runs turn spawned a detached/systemd finisher, returned “Executing now,” the worker failed after the parent run ended, and no completion resumed the exact Wizard session. Current API sessions have async_delivery=False. Background notify support is validated after spawn, current routing prefers HERMES_SESSION_KEY (run/approval ID) over HERMES_SESSION_CHAT_ID (actual Wizard session), routing metadata may be checkpointed too late, standalone wizard-api has no GatewayRunner post-turn watcher, and completed-result receipts are not a durable delivery outbox.
+
+Implement the smallest maintainable extension of existing primitives, with these invariants:
+
+1. Add a distinct completion-delivery context in gateway/session_context.py. Keep async_delivery_supported semantics unchanged. Use a mode such as api_session_wake only for authenticated API sessions with server-owned session history.
+2. APIServerAdapter must bind that mode for resumable Wizard/API sessions, advertise an explicit background_process_completion capability, and own a replay task from connect() so standalone wizard-api.service works without GatewayRunner.
+3. /v1/runs sync execution must pass the computed mode into the session binding.
+4. terminal(background=true, notify=true) must validate durable completion support BEFORE spawning. Existing push behavior stays. An unsupported finite API run must fail with no PID/process entry. API session wake must persist the raw resumable destination from HERMES_SESSION_CHAT_ID, never the run/approval key. Watch-pattern streaming remains unsupported for API wake.
+5. Promote per-process result receipts into a small durable completion outbox (schema 2) using atomic writes and cross-process receipt locks. It must arm before successful spawn is exposed; completion is pending before the process leaves running state; pending/claimed receipts survive settled-result pruning; legacy schema-1 receipts never replay. Provide exclusive claim, retry/release, delivered/consumed settlement, and adapter-specific restore. Preserve existing result-read APIs.
+6. ProcessRegistry must carry completion_delivery, delivery_adapter_id, and survive_gateway_restart. Recovery of a dead armed worker must create a pending unknown-outcome completion instead of silently dropping it. wait/log/explicit kill consumption must prevent later duplicate wake. The route metadata must be in the first checkpoint/receipt so an immediate exit cannot win the race.
+7. APIServerAdapter’s replay loop claims only its adapter receipts, reconciles running receipts, formats with existing format_process_notification(), self-posts a new turn to the exact original API session through gateway.wake, retries on admission/delivery failure, and settles only after accepted delivery. Use a stable process-completion idempotency key if the wake API supports it; if it does not, extend it narrowly.
+8. Correct gateway/run_notifications.py routing to prefer origin_session_id, then API chat_id, over run session_key.
+9. Planned gateway restart may preserve only explicitly armed survive_gateway_restart jobs with a confirmed private systemd scope; normal shutdown semantics stay. If current registry architecture makes this unsafe, fail closed and document the limitation rather than weakening cleanup.
+10. Existing Wizard/Helm/background behavior must remain compatible. Do not add a new scheduler or auto-create Kanban cards.
+
+Testing constraints:
+- Reproduce the real event order: spawn armed process -> parent API run ends -> producer/API process is recreated -> terminal receipt replays once into exact original session.
+- Cover unsupported API session no-spawn, first-checkpoint atomic metadata, exclusive claim/retry, legacy no-replay, pending-pruning immunity, consumed no-replay, immediate-exit race, dead detached recovery, and wrong-session regression.
+- Prefer extending existing behavioral tests/subtests over increasing the repository’s test-definition ceiling. Run focused relevant tests plus ruff/diff checks. If a pre-existing test encodes the intentionally changed behavior, update it explicitly.
+- Do not change existing Markdown behavior from d661.
+
+Before finishing: inspect git diff, remove this prompt file from tracking if it appears, commit only the intended source/tests with a clear message, and report commit SHA, changed files, tests run/results, and any unresolved blocker. Do not claim live activation.

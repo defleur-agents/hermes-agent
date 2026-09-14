@@ -3288,3 +3288,109 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="s2", gateway_session_key="ch")
         assert captured[1]["model"] == "anthropic/claude-opus-4.6"
+
+
+# ---------------------------------------------------------------------------
+# Adapter-owned lifetime loops
+#
+# The orphan-run sweep and the durable completion replay are started from
+# connect() BEFORE the listener binds, and a standalone wizard-api.service has
+# no GatewayRunner to call cancel_background_tasks(). Both endings — a failed
+# bind and an ordinary disconnect — are the adapter's own responsibility.
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterOwnedServiceTasks:
+    @staticmethod
+    def _adapter(monkeypatch):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._api_key = "k" * 32
+        monkeypatch.setattr(adapter, "_api_key_passes_startup_guard", lambda: True)
+        monkeypatch.setattr(adapter, "_wire_plugin_handlers", lambda app: None)
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_a_failed_bind_cancels_the_loops_it_already_started(self, monkeypatch):
+        """A non-retryable bind failure must not leave two loops ticking forever.
+
+        ``gateway.run``'s reconnect watcher constructs a FRESH adapter per retry, so a leaked
+        replay loop per attempt would keep claiming completions on behalf of an adapter that
+        never served a request — and keep the old one's file handles alive with it.
+        """
+        adapter = self._adapter(monkeypatch)
+
+        async def boom(*args, **kwargs):
+            raise OSError("bind refused")
+
+        monkeypatch.setattr("aiohttp.web.TCPSite.start", boom)
+        assert await adapter.connect() is False
+        assert adapter._service_tasks == set()
+        await asyncio.sleep(0)
+        assert not [task for task in adapter._background_tasks if not task.done()]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_the_loops_without_a_gateway_runner(self, monkeypatch):
+        """The standalone wizard-api.service path: nobody else is going to cancel these."""
+        adapter = self._adapter(monkeypatch)
+        adapter._host, adapter._port = "127.0.0.1", 0
+        assert await adapter.connect() is True
+        running = [task for task in adapter._service_tasks if not task.done()]
+        assert len(running) == 2, "orphan-run sweep + durable completion replay"
+
+        await adapter.disconnect()
+        assert adapter._service_tasks == set()
+        for task in running:
+            assert task.done()
+
+
+# ---------------------------------------------------------------------------
+# Restart-stable duplicate suppression for completion wakes
+# ---------------------------------------------------------------------------
+
+
+class TestCompletionWakeIdempotency:
+    @pytest.mark.asyncio
+    async def test_an_already_served_wake_replays_instead_of_running_a_second_turn(self):
+        """``_IdempotencyCache`` is in-memory; the wake ledger is on disk, so it survives the
+        restart that would otherwise turn one completion into two real turns on the session."""
+        from gateway.platforms.api_server_openai_routes import (
+            _WAKE_ALREADY_DELIVERED, OpenAICompatRoutesMixin)
+        from tools import process_registry_outbox as outbox
+
+        replay = OpenAICompatRoutesMixin._replay_already_served_wake
+        key = f"{outbox.WAKE_KEY_PREFIX}proc_deadbeefcafe-1700000000"
+
+        # No receipt names this key: not ours to govern, so an ordinary request is unaffected.
+        assert await replay("a-client-supplied-key") is None
+        assert await replay(key) is None
+
+        record = {"id": "proc_deadbeefcafe", "started_at": 1700000000,
+                  "schema": outbox.RECEIPT_SCHEMA,
+                  "completion": {"state": "pending", "adapter_id": "api_server", "profile": ""}}
+        outbox.write_receipt(record)
+        assert await replay(key) is None, "the first wake runs the turn"
+        outcome = await replay(key)
+        assert outcome is not None, "the second must not"
+        (result, usage), err = outcome
+        assert err is None and usage is None
+        assert result is _WAKE_ALREADY_DELIVERED
+        assert "already delivered" in result["final_response"]
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_ledger_answers_transiently_instead_of_guessing(self, monkeypatch):
+        """429, not "already delivered": the wake producer retries a 429, and a guess here
+        would silently drop a completion nobody else is watching."""
+        import contextlib
+
+        from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
+        from tools import process_registry_outbox as outbox
+
+        @contextlib.contextmanager
+        def wedged(session_id, *, timeout=5.0):
+            yield False
+
+        monkeypatch.setattr(outbox, "receipt_lock", wedged)
+        result, err = await OpenAICompatRoutesMixin._replay_already_served_wake(
+            f"{outbox.WAKE_KEY_PREFIX}proc_deadbeefcafe-1700000000")
+        assert result is None
+        assert err.status == 429

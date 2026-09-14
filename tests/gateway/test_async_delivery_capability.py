@@ -193,7 +193,8 @@ class TestAdapterCapabilityFlag:
             clear_session_vars, completion_delivery_mode)
 
         resolve = APIServerAdapter._completion_delivery_mode
-        keyed, keyless = SimpleNamespace(_api_key="k"), SimpleNamespace(_api_key="")
+        keyed = SimpleNamespace(_expected_api_key=lambda: "k")
+        keyless = SimpleNamespace(_expected_api_key=lambda: "")
         assert resolve(keyed, chat_id="sid", session_history_delivery="1") == "api_session_wake"
         # previous_response_id / caller-supplied history: no SessionDB continuation to resume.
         assert resolve(keyed, chat_id="sid", session_history_delivery="") == ""
@@ -264,7 +265,8 @@ class TestTerminalNotifyGate:
 
         tokens = set_session_vars(
             platform="api_server", chat_id="s1", session_key="run_1", async_delivery=False,
-            session_history_delivery="1", completion_delivery="api_session_wake")
+            profile="wiz", session_history_delivery="1",
+            completion_delivery="api_session_wake")
         try:
             d = self._run_bg("sleep 30 && echo DONE")
         finally:
@@ -274,8 +276,27 @@ class TestTerminalNotifyGate:
             session = process_registry.get(d["session_id"])
             assert session.completion_delivery == "api_session_wake"
             assert session.watcher_chat_id == "s1"
+            # The bound multiplex profile travels with the spawn: it is what later picks the
+            # /p/<profile>/ wake route and that profile's own credential.
+            assert session.delivery_profile == "wiz"
             assert len(process_registry.pending_watchers) == 0
         finally:
             process_registry.kill_process(d["session_id"], consume_output=False)
+
+    def test_a_named_profile_without_its_own_key_is_denied_the_durable_route(self):
+        """``_completion_delivery_mode`` asks for the key authorized on THIS request's route.
+
+        Under multiplexing a named profile authenticates with its own ``API_SERVER_KEY``; if it
+        has none, promising a durable completion would mean promising a wake that could only be
+        sent under the owner's credential, into the owner's home. Promise nothing instead."""
+        from types import SimpleNamespace
+
+        from gateway.platforms.api_server import APIServerAdapter
+
+        resolve = APIServerAdapter._completion_delivery_mode
+        keyed = SimpleNamespace(_expected_api_key=lambda: "profile-key")
+        keyless = SimpleNamespace(_expected_api_key=lambda: "")
+        assert resolve(keyed, chat_id="sid", session_history_delivery="1") == "api_session_wake"
+        assert resolve(keyless, chat_id="sid", session_history_delivery="1") == ""
 
 

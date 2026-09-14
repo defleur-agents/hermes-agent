@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +53,16 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
 
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
-                       idempotency_key: str = "") -> None:
+                       idempotency_key: str = "", profile: str = "", api_key: str = "") -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters.
     ``idempotency_key`` rides the self-post as the ``Idempotency-Key`` header: a durable producer
     that retries after an accepted-but-unacknowledged delivery replays the stored response instead
-    of running the turn a second time. Raises on failure so the caller can rewind/retry."""
+    of running the turn a second time. ``profile`` routes the self-post to that multiplex
+    profile's ``/p/<profile>/`` mirror (``""`` = the default, unprefixed route) and ``api_key``
+    is the credential authorized THERE — a named profile's session is not reachable with, and
+    must not be woken under, the owner's key. Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
@@ -69,9 +73,10 @@ async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source:
     if not session_id:
         raise ValueError("deliver_wake: non-push adapter (supports_async_delivery=False) "
                          "requires the raw session id to self-post the wake turn")
-    # Passed only when a producer actually has a stable key, so the ordinary wake keeps today's
-    # call shape (and no self-post starts carrying an empty header).
-    extra = {"idempotency_key": idempotency_key} if idempotency_key else {}
+    # Passed only when a producer actually supplies them, so the ordinary wake keeps today's call
+    # shape (no self-post starts carrying an empty header or an empty profile prefix).
+    extra = {key: value for key, value in (("idempotency_key", idempotency_key),
+                                           ("profile", profile), ("api_key", api_key)) if value}
     await _self_post_chat_completion(adapter, text=text, session_id=session_id, **extra)
 
 
@@ -139,24 +144,30 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
 
 
 async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str,
-                                     idempotency_key: str = "") -> None:
+                                     idempotency_key: str = "", profile: str = "",
+                                     api_key: str = "") -> None:
     """POST the wake text to the in-pod API server as a normal session turn, using the adapter's
-    own bind host/port/key. Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
-    ``API_SERVER_KEY``, so a missing key is a hard error rather than a wake in a fresh session
-    nobody watches."""
+    own bind host/port and the credential authorized for the target route. Session continuation
+    via ``X-Hermes-Session-Id`` is 403-gated on ``API_SERVER_KEY``, so a missing key is a hard
+    error rather than a wake in a fresh session nobody watches.
+
+    ``profile`` selects the multiplex mirror: the sessions, history and key of a named profile
+    live behind ``/p/<profile>/``, and posting a named profile's wake to the bare ``/v1/`` route
+    would resolve the session id against the OWNER's home — a different conversation, or none."""
     import aiohttp
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):
         host = "127.0.0.1"  # wildcard bind — connect over loopback
     port = int(getattr(adapter, "_port", 0) or 8642)
-    api_key = str(getattr(adapter, "_api_key", "") or "")
+    api_key = str(api_key or getattr(adapter, "_api_key", "") or "")
     if not api_key:
         raise RuntimeError("wake self-post requires API_SERVER_KEY: session continuation via "
                            "X-Hermes-Session-Id is rejected (403) on an unauthenticated API "
                            "server, so the wake cannot reach the target session")
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    prefix = f"/p/{quote(profile, safe='')}" if profile else ""
+    url = f"http://{host}:{port}{prefix}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key

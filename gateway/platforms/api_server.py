@@ -1187,6 +1187,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._session_dbs: Dict[str, Any] = {}  # per-profile-home SessionDB cache
         self._session_db_cache_lock = threading.Lock()
         self._session_db_cache_closed = False
+        # Adapter-lifetime loops (orphan-run sweep, durable completion replay) this adapter
+        # cancels itself — see ``_start_service_task``.
+        self._service_tasks: set = set()
         # Last-known-good model per gateway_session_key ("*" = process-wide; never session_id,
         # which is per request -> unbounded). Recovers a transient empty model resolution.
         self._last_resolved_model: Dict[str, str] = {}
@@ -3604,6 +3607,42 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
+    def _start_service_task(self, coro) -> "asyncio.Task":
+        """Start an adapter-lifetime loop (orphan-run sweep, completion replay) and own it.
+
+        These two outlive individual requests and are started before the listener binds, so
+        neither the GatewayRunner's ``cancel_background_tasks()`` nor a successful bind can be
+        assumed: a failed bind used to leave both loops running against a half-built adapter
+        forever, and a standalone ``wizard-api.service`` disconnect never cancelled them at all.
+        They stay in ``_background_tasks`` too so a full runner shutdown still sees them.
+        """
+        task = asyncio.create_task(coro)
+        self._service_tasks.add(task)
+        task.add_done_callback(self._service_tasks.discard)
+        self._track_background_task(task)
+        return task
+
+    async def _cancel_service_tasks(self) -> None:
+        """Cancel the adapter-owned lifetime loops and wait (bounded) for them to unwind.
+
+        ``getattr``, like the rest of ``disconnect()``: the reconnect watcher and several tests
+        tear down bare adapters built without ``__init__``, and a teardown step must not be the
+        thing that raises."""
+        owned = getattr(self, "_service_tasks", None)
+        if not owned:
+            return
+        tasks = [task for task in owned if not task.done()]
+        if not tasks:
+            return
+        for task in tasks:
+            self._expected_cancelled_tasks.add(task)
+            task.cancel()
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True),
+                timeout=5.0)
+        self._service_tasks.clear()
+
     def _concurrency_limited_response(self) -> Optional["web.Response"]:
         """429 when the concurrent-run cap is reached (0 disables), else None. Uses the same
         adapter-owned work count as shutdown draining (admitted requests included)."""
@@ -3628,8 +3667,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         (``session_history_delivery``, the #98619 audit), there must BE an id to resume, and the
         wake self-post must be able to authenticate — session continuation is 403-gated on
         ``API_SERVER_KEY``, so without a key the wake would land in a fresh session nobody reads.
+
+        The key checked is ``_expected_api_key()``, i.e. the one authorized for THIS request's
+        ``/p/<profile>/`` route, because that is the credential the replay will present. A named
+        profile with no key of its own promises nothing here rather than promising a wake that
+        would have to borrow the owner's.
         """
-        if session_history_delivery != "1" or not chat_id or not self._api_key:
+        if session_history_delivery != "1" or not chat_id or not self._expected_api_key():
             return ""
         return COMPLETION_DELIVERY_API_SESSION_WAKE
 
@@ -3981,12 +4025,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._app["api_server_adapter"] = self
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
-            self._track_background_task(asyncio.create_task(self._sweep_orphaned_runs()))
             # Owned by the ADAPTER, not the GatewayRunner: a standalone wizard-api.service has no
             # runner, and its finite runs are exactly the ones whose background workers outlive
-            # the turn that spawned them.
+            # the turn that spawned them. Tracked in _service_tasks as well so the adapter can
+            # cancel them itself — cancel_background_tasks() is a GatewayRunner shutdown step
+            # these two loops must not depend on, and they are started BEFORE the listener binds.
             from gateway.platforms.api_server_completions import completion_replay_loop
-            self._track_background_task(asyncio.create_task(completion_replay_loop(self)))
+            self._start_service_task(self._sweep_orphaned_runs())
+            self._start_service_task(completion_replay_loop(self))
             # Network-accessible + unsandboxed local terminal backend = host-user RCE surface;
             # warn, don't refuse (the operator may have a firewall / strong key).
             if is_network_accessible(self._host):
@@ -4044,6 +4090,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "[%s] Could not bind %s:%d: %s. Set a different port in "
                     "config.yaml: platforms.api_server.port",
                     self.name, self._host, self._port, exc)
+                await self._cancel_service_tasks()
                 return False
             from gateway.platforms.shared_ingress import listener_base_url
             self._mark_connected(listener_base=listener_base_url(self._host, self._port))
@@ -4053,6 +4100,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return True
         except Exception as e:
             logger.error("[%s] Failed to start API server: %s", self.name, e)
+            # Whatever failed after _start_service_task() left those loops running against an
+            # adapter that will never serve; the reconnect watcher builds a fresh one per retry.
+            await self._cancel_service_tasks()
             return False
 
     async def disconnect(self) -> None:
@@ -4066,6 +4116,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        # First: the adapter's own lifetime loops. A standalone wizard-api.service has no
+        # GatewayRunner to call cancel_background_tasks(), so without this the completion-replay
+        # and orphan-sweep loops keep ticking against a torn-down adapter for the process's life.
+        await self._cancel_service_tasks()
         if self._response_store is not None:
             try:
                 self._response_store.close()

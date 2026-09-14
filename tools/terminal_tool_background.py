@@ -66,11 +66,24 @@ _API_DURABLE_UNSUPPORTED_ERROR = (
 )
 
 # The durable API wake replays ONE terminal completion into the session. Streaming interim
-# watch-pattern matches would each need their own authorized turn, which this route does not grant.
-_API_WATCH_UNSUPPORTED_NOTE = (
-    'watch_patterns are not available on API sessions: the durable completion route delivers a '
-    "process's FINAL outcome only, never interim pattern matches. Use notify_on_complete=true to "
-    "be told when it exits, or process(action='poll') to inspect it yourself."
+# watch-pattern matches would each need their own authorized turn, which this route does not
+# grant. Stripping the patterns and spawning anyway was a silent downgrade of the one thing the
+# caller asked for: a process watched for a pattern it will now never be told about.
+_API_WATCH_UNSUPPORTED_ERROR = (
+    'watch_patterns are not available on API sessions, so NO process was started (there is no '
+    "PID to poll). The durable completion route delivers a process's FINAL outcome only, never "
+    'interim pattern matches, and this run is finite: it ends when this response is returned. '
+    "Use notify_on_complete=true to be told when the process exits, or run it in the FOREGROUND "
+    '(background=false) and report what happened in this turn.'
+)
+
+# Arming the durable receipt failed (read-only home, full disk, a wedged receipt lock). The
+# process was spawned and has already been reaped: say so plainly rather than reporting a
+# started job whose completion nothing on disk can deliver.
+_API_ARMING_FAILED_ERROR = (
+    'This API session could not durably record the background completion, so the process was '
+    'terminated and NO job is running. Retry, or run the command in the FOREGROUND '
+    '(background=false) and report the real result in this turn.'
 )
 
 # proc_session attribute -> HERMES_SESSION_* env var carrying it.
@@ -122,7 +135,13 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
 
 
 class _UnsupportedCompletion(Exception):
-    """The requested completion contract cannot be honored on this session — do not spawn."""
+    """The requested completion contract cannot be honored on this session — do not spawn.
+
+    ``message`` is what the model is told; it always states that nothing was started."""
+
+    def __init__(self, message: str = _API_DURABLE_UNSUPPORTED_ERROR):
+        super().__init__(message)
+        self.message = message
 
 
 def _resolve_completion_support(notify_on_complete, watch_patterns, result_data):
@@ -130,7 +149,7 @@ def _resolve_completion_support(notify_on_complete, watch_patterns, result_data)
 
     Returns the ``session_fields`` the spawn must pre-bind (routing, notify flag, durable mode)
     and the effective ``watch_patterns``. Raises :class:`_UnsupportedCompletion` when a finite API
-    run asks for a notification nothing could ever deliver — refusing before the spawn is what
+    run asks for completion semantics nothing could ever honor — refusing before the spawn is what
     keeps an unsupported run from leaving a PID behind with a promise attached.
     """
     from gateway.session_context import (
@@ -143,19 +162,24 @@ def _resolve_completion_support(notify_on_complete, watch_patterns, result_data)
         return {**routing, "notify_on_complete": bool(notify_on_complete)}, watch_patterns
     mode = completion_delivery_mode()
     if mode:
-        if watch_patterns:
-            # Watch-pattern streaming needs an authorized turn per match; the durable API route
-            # grants exactly one, for the terminal outcome.
-            result_data["watch_patterns_unsupported"] = _API_WATCH_UNSUPPORTED_NOTE
-            watch_patterns = None
-        if not notify_on_complete:
-            return {}, None
+        if watch_patterns and not notify_on_complete:
+            # Fail closed, do not downgrade: watch-pattern streaming needs an authorized turn per
+            # match and the durable route grants exactly one, for the terminal outcome. Spawning
+            # with the patterns stripped would run the job and silently never report a match —
+            # and on a finite run there is no later turn in which to notice.
+            raise _UnsupportedCompletion(_API_WATCH_UNSUPPORTED_ERROR)
         # The resumable destination is the bound chat id (the real session), never the
         # run/approval session_key — that key is per-run and resumes no conversation.
         if not routing.get("watcher_chat_id"):
             raise _UnsupportedCompletion()
+        # watch_patterns are returned unchanged: with notify_on_complete necessarily true here,
+        # the surface-independent conflict resolver drops them AND says why, rather than this
+        # route stripping them with no explanation.
         return {**routing, "notify_on_complete": True, "completion_delivery": mode,
-                "delivery_adapter_id": get_session_env("HERMES_SESSION_PLATFORM", "")}, None
+                "delivery_adapter_id": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                # Multiplex profile that owns this turn: the receipt is written into that
+                # profile's home and replayed through its own /p/<profile>/ route and key.
+                "delivery_profile": get_session_env("HERMES_SESSION_PROFILE", "")}, watch_patterns
     if get_session_env("HERMES_SESSION_PLATFORM", "") == "api_server":
         raise _UnsupportedCompletion()
     result_data["notify_on_complete"] = False
@@ -190,6 +214,7 @@ def spawn_background_process(
     exit_code 0 immediately, so the stale-interrupt kill cannot occur here.
     """
     from tools.process_registry import process_registry
+    from tools.process_registry_outbox import DurableArmingError
     from tools.terminal_tool import (
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )
@@ -203,10 +228,10 @@ def spawn_background_process(
         # fail with no PID and no process entry, not with a detached promise nobody can keep.
         session_fields, watch_patterns = _resolve_completion_support(
             notify_on_complete, watch_patterns, result_data)
-    except _UnsupportedCompletion:
-        logger.warning("Refusing a detached notify-on-complete spawn: this API session has no "
-                       "durable completion route")
-        return json.dumps({"output": "", "exit_code": -1, "error": _API_DURABLE_UNSUPPORTED_ERROR},
+    except _UnsupportedCompletion as unsupported:
+        logger.warning("Refusing a detached background spawn: this API session cannot honor the "
+                       "requested completion semantics")
+        return json.dumps({"output": "", "exit_code": -1, "error": unsupported.message},
                           ensure_ascii=False)
     notify_on_complete = bool(session_fields.get("notify_on_complete"))
     watch_patterns, conflict_note = _resolve_notification_flag_conflict(
@@ -247,6 +272,13 @@ def spawn_background_process(
         if watch_patterns:
             result_data["watch_patterns"] = proc_session.watch_patterns
         return json.dumps(result_data, ensure_ascii=False)
+    except DurableArmingError:
+        # The registry already reaped the child: no PID, no process entry, no promise. Failing
+        # the tool call is the point — the alternative is an "Executing now" nobody can honor.
+        logger.warning("Refusing a detached notify-on-complete spawn: the durable completion "
+                       "obligation could not be written", exc_info=True)
+        return json.dumps({"output": "", "exit_code": -1, "error": _API_ARMING_FAILED_ERROR},
+                          ensure_ascii=False)
     except Exception as e:
         return json.dumps({
             "output": "", "exit_code": -1,

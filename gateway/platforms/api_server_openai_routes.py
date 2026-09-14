@@ -57,6 +57,18 @@ async def _iter_stream_items(stream_q, agent_task, response):
         last_activity = time.monotonic()
 
 
+# The stand-in "agent result" served for a background-completion wake whose turn already ran in
+# some process (see ``_replay_already_served_wake``). Shaped like a completed agent result so both
+# OpenAI-compatible response builders can render it without special-casing; it deliberately says
+# nothing about the completion's content, because the turn that DID run already delivered that
+# into the session's own history.
+_WAKE_ALREADY_DELIVERED = {
+    "final_response": "This background completion was already delivered to this session; "
+                      "no second turn was run.",
+    "completed": True, "partial": False, "failed": False, "error": None, "messages": [],
+}
+
+
 def _result_flags(result: Any) -> tuple:
     """``(completed, partial, failed, error)`` from an agent result dict (defaults if not a dict)."""
     if not isinstance(result, dict):
@@ -617,9 +629,20 @@ class OpenAICompatRoutesMixin:
         colliding across profiles, or a rotated API_SERVER_KEY, never replays another principal's response.
         ``route`` is the logical endpoint (``/v1/...`` and its ``/p/<profile>/v1/...`` alias are the same
         route), folded into the key because the store keeps the fingerprint only as the slot's value.
+
+        ``_idem_cache`` is also purely in-memory with a 5-minute TTL, which is enough for a client
+        retrying over one connection and NOT enough for a durable producer: a background-completion
+        wake accepted here, followed by a gateway restart before its outbox claim settled, would be
+        re-posted with the same key into an empty cache and run as a real second turn on the user's
+        session. Completion wakes therefore pass a durable at-most-once gate first, held in the
+        receipt their key names (``tools.process_registry_outbox.reserve_wake_delivery``).
         """
         from gateway.platforms.api_server import _error_response, _idem_cache, _make_request_fingerprint
         idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key:
+            replay = await self._replay_already_served_wake(idempotency_key)
+            if replay is not None:
+                return replay
         try:
             if idempotency_key:
                 principal_scope = self._run_idempotency_scope(request)
@@ -632,6 +655,31 @@ class OpenAICompatRoutesMixin:
         except Exception as e:
             logger.error("Error running agent for %s: %s", log_label, e, exc_info=True)
             return None, _error_response(f"Internal server error: {e}", 500, err_type="server_error")
+
+    @staticmethod
+    async def _replay_already_served_wake(idempotency_key: str):
+        """Restart-stable duplicate gate for background-completion wakes.
+
+        Returns None for every ordinary request (this governs only keys the outbox minted), a
+        ``_run_idempotent``-shaped replay tuple when this completion's turn already ran in SOME
+        process, or a 429 when the ledger is momentarily unreadable — transient by design, because
+        the wake producer retries a 429 and must not be told "already delivered" on a guess.
+
+        The reservation is taken BEFORE the turn runs, so a crash mid-turn loses the wake rather
+        than risking a second one; the result itself stays queryable through ``process_manage``.
+        """
+        import asyncio
+
+        from gateway.platforms.api_server import _error_response
+        from tools.process_registry_outbox import WAKE_REPLAY, WAKE_UNAVAILABLE, reserve_wake_delivery
+
+        decision = await asyncio.to_thread(reserve_wake_delivery, idempotency_key)
+        if decision == WAKE_REPLAY:
+            return (_WAKE_ALREADY_DELIVERED, None), None
+        if decision == WAKE_UNAVAILABLE:
+            return None, _error_response(
+                "Completion-wake idempotency ledger is busy; retry", 429, err_type="server_error")
+        return None
 
     async def _prepare_sse_response(
         self, request: "web.Request", session_id: Optional[str], gateway_session_key: Optional[str],

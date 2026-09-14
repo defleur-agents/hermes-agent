@@ -462,6 +462,10 @@ class ProcessSession:
     # ``delivery_adapter_id`` names the surface whose replay loop owns the receipt.
     completion_delivery: str = ""
     delivery_adapter_id: str = ""
+    # Multiplex profile that spawned this worker ("" = default). Part of the receipt's immutable
+    # identity: it selects the /p/<profile>/ wake path AND the credential used on it, so a
+    # completion can only ever be replayed under the principal that authorized the spawn.
+    delivery_profile: str = ""
     # Whether this worker owns a private systemd scope and could genuinely outlive the gateway.
     # Shutdown still kills it (see the outbox module's documented limitation); recovery uses the
     # flag to tell a restart survivor from a worker that shared the gateway's cgroup.
@@ -506,7 +510,7 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "watch_patterns",
-    "completion_delivery", "delivery_adapter_id", "survive_gateway_restart")
+    "completion_delivery", "delivery_adapter_id", "delivery_profile", "survive_gateway_restart")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -932,6 +936,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # Arm the durable receipt before the reader exists, so an instant-exit child cannot
         # settle a completion whose route metadata is not yet on disk. Deliberately outside
         # the registry lock: it takes a cross-process receipt lock and does file I/O.
+        # Raises DurableArmingError on failure — every caller reaps the already-spawned child,
+        # because reporting a notify-on-complete spawn as started when nothing on disk can
+        # deliver it is the exact promise this machinery exists to keep.
         self._arm_durable_completion(session)
         with self._lock:
             self._prune_if_needed()
@@ -942,18 +949,31 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._write_checkpoint()
 
     def _arm_durable_completion(self, session: ProcessSession) -> None:
-        """Write the ``armed`` outbox receipt for a session that declared a durable route."""
+        """Write the ``armed`` outbox receipt for a session that declared a durable route.
+
+        Fails the whole ``_track_started`` when the obligation cannot be written (lock busy,
+        read-only home, full disk). There is no useful middle state: a session with
+        ``completion_delivery`` set was told, inside its own turn, that a notification WILL
+        arrive after the turn ends. Without the receipt nothing can deliver it and nothing can
+        even discover that it is owed, so the honest outcome is no process and a failed tool
+        call — which is what the caller turns this exception into.
+        """
         if not session.completion_delivery:
             return
         from agent.redact import redact_sensitive_text
-        from tools.process_registry_outbox import arm
+        from tools.process_registry_outbox import DurableArmingError, arm
         from tools.process_registry_results import _RESULT_FIELDS
 
-        with suppress(Exception):
-            session.survive_gateway_restart = bool(session.systemd_unit)
-            base = {key: getattr(session, key) for key in _RESULT_FIELDS} | {"output": ""}
-            base["command"] = redact_sensitive_text(session.command, code_file=True, force=True)
+        session.survive_gateway_restart = bool(session.systemd_unit)
+        base = {key: getattr(session, key) for key in _RESULT_FIELDS} | {"output": ""}
+        base["command"] = redact_sensitive_text(session.command, code_file=True, force=True)
+        try:
             arm(session, base)
+        except DurableArmingError:
+            raise
+        except Exception as exc:  # unexpected shape (serialization, redaction) — same verdict
+            raise DurableArmingError(
+                f"could not arm the durable completion for {session.id}: {exc}") from exc
 
     def _spawn_local_pty(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
         """PTY spawn for interactive CLI tools (Codex, Claude Code, REPLs).
@@ -975,8 +995,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session._pty = pty_proc
-        self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
+        try:
+            self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
+        except Exception:
+            self._reap_untracked_pty(session, pty_proc)
+            raise
         return session
+
+    def _reap_untracked_pty(self, session: ProcessSession, pty_proc) -> None:
+        """Post-spawn setup failed on the PTY path: kill the orphaned child so nothing leaks
+        untracked (the pipe path's ``_reap_untracked``, for a PtyProcess handle)."""
+        with suppress(Exception):
+            if session.systemd_unit:
+                _stop_systemd_unit(session.systemd_unit)
+            pty_proc.terminate(force=True)
 
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
@@ -990,6 +1022,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # pipe open forever when B is a long-running server. The rewriter turns it into
         # ``A && { B & }``. Lazy import: terminal_tool imports this module.
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
+        from tools.process_registry_outbox import DurableArmingError
         from tools.terminal_tool_sudo import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
@@ -999,6 +1032,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if use_pty:
             try:
                 return self._spawn_local_pty(session, safe_command, env_vars)
+            except DurableArmingError:
+                # Not a PTY problem: the durable obligation could not be written, and the pipe
+                # fallback would arm the same receipt in the same home and fail the same way —
+                # after running the command a second time.
+                raise
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
@@ -1112,8 +1150,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with self._lock:
                 self._prune_if_needed()
         else:
-            self._track_started(
-                session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+            try:
+                self._track_started(
+                    session, self._env_poller_loop, f"proc-poller-{session.id}",
+                    (env, log_path, pid_path, exit_path))
+            except Exception:
+                # Same contract as the local path's ``_reap_untracked``: a child we could not
+                # finish registering must not keep running unowned inside the sandbox.
+                with suppress(Exception):
+                    env.execute(f"kill -9 {session.pid} 2>/dev/null", timeout=5)
+                raise
         return session
 
     # ----- Reader / Poller Threads -----
@@ -1403,12 +1449,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _consume_completion(self, session_id: str) -> None:
         """The owning turn has the result in hand (wait/read_log/explicit kill): suppress the
         in-process notification AND settle any durable receipt, so no later replay wakes the
-        session a second time with a result it already read."""
+        session a second time with a result it already read.
+
+        ``consume()`` does not steal a live delivery claim; on a claimed receipt it records the
+        intent and the claim holder converges it. Either way the completion can only ever
+        produce one turn, which is the property that matters here."""
         self._completion_consumed.add(session_id)
         with suppress(Exception):
             from tools.process_registry_outbox import consume
 
-            consume(session_id)
+            if not consume(session_id):
+                logger.debug("Durable completion %s was not settled as consumed here (no durable "
+                             "receipt, or a delivery holds its claim)", session_id)
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on

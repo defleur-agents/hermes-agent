@@ -26,17 +26,19 @@ _RESULT_FIELDS = (
 )
 
 
-def _drop(path) -> None:
-    path.unlink(missing_ok=True)
-    path.with_suffix(".lock").unlink(missing_ok=True)
-
-
 def retained_result_paths():
-    """Prune settled receipts by completion time (jobs can take days), newest first.
+    """Prune SETTLED receipts by completion time (jobs can take days), newest first.
 
-    A completion that still owes a delivery is immune to the count cap — pruning it is exactly
-    the silent loss the outbox exists to prevent — but not immortal: past the retention window
-    nobody is waiting on it, and immunity without a bound would grow the directory forever.
+    A completion that still owes a delivery — armed, pending, or claimed — is never pruned, by
+    age or by the count cap. Deleting one is exactly the silent loss the outbox exists to
+    prevent: the process really ran, its session really is waiting, and a receipt that ages out
+    at seven days takes the only record of that obligation with it. Unsettled rows are not
+    immortal either; they converge through the delivery state machine to ``delivered``,
+    ``consumed``, or — after the attempt budget is spent, with a warning naming the completion —
+    ``dropped``, and only then become prunable.
+
+    Deletion goes through ``outbox.drop_receipt``, which re-checks that under the receipt lock
+    and unlinks the ``.lock`` sidecar only while holding it.
     """
     directory = outbox.results_dir()
     cutoff = time.time() - RESULT_RETENTION_SECONDS
@@ -44,19 +46,19 @@ def retained_result_paths():
     for path in directory.glob("proc_*.json"):
         try:
             modified = path.stat().st_mtime
-            if modified < cutoff:
-                _drop(path)
-            else:
-                retained.append((modified, path))
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             continue  # Another producer pruned it.
+        if modified < cutoff and not outbox.is_unsettled(outbox.read_receipt(path)):
+            outbox.drop_receipt(path)
+            continue
+        retained.append((modified, path))
     retained.sort(key=lambda item: (item[0], item[1].name), reverse=True)
     kept_over_cap = []
     for _, path in retained[MAX_RETAINED_RESULTS:]:
         if outbox.is_unsettled(outbox.read_receipt(path)):
             kept_over_cap.append(path)
         else:
-            _drop(path)
+            outbox.drop_receipt(path)
     return [path for _, path in retained[:MAX_RETAINED_RESULTS]] + kept_over_cap
 
 
@@ -80,7 +82,9 @@ def save_completed_result(session, *, notification=None, consumed: bool = False)
         if not session.completion_delivery:
             outbox.write_receipt(record)
         else:
-            with outbox.receipt_lock(session.id) as held:
+            # Long wait on purpose: this is the ONLY chance to make the outcome durable, and
+            # every other holder of this lock keeps it for microseconds.
+            with outbox.receipt_lock(session.id, timeout=30.0) as held:
                 if not held:
                     # Writing without the lock could clobber a concurrent consumer's claim; the
                     # completion is lost rather than duplicated, and the result stays in memory.

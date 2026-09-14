@@ -81,24 +81,46 @@ A `/v1/runs` turn ends with its HTTP response, so a detached `notify_on_complete
 has no live parent. `session_context.completion_delivery_mode()` declares the durable route home;
 `APIServerAdapter` binds `api_session_wake` only for an authenticated session whose history the
 server owns and can resume (same #98619 audit as `session_history_delivery`), and advertises it as
-the `background_process_completion` capability. The terminal tool validates that route BEFORE
-spawning: with no route an API run is refused outright (no PID, no process entry) rather than
-handed a promise nothing can keep; other finite surfaces (one-shot CLI, cron, Kanban) keep their
-"poll it yourself" downgrade. Watch-pattern streaming is not available on this route.
+the `background_process_completion` capability. The key it checks is `_expected_api_key()`, the one
+authorized on THIS request's route, so a named profile with no key of its own promises nothing
+rather than promising a wake that would borrow the owner's. The terminal tool validates that route
+BEFORE spawning and fails closed on anything it cannot honor: no route, or watch-pattern streaming
+(which needs an authorized turn per match where the route grants one, for the terminal outcome),
+means no PID and no process entry rather than a promise nothing can keep. Other finite surfaces
+(one-shot CLI, cron, Kanban) keep their "poll it yourself" downgrade.
 
 An armed spawn writes its route into the first checkpoint AND the first receipt
 (`tools/process_registry_outbox.py`, receipt schema 2), so an immediate exit cannot produce a
 routeless completion; the exit settles it to `pending` before the session leaves the running set.
-The `APIServerAdapter` owns the replay loop (started from `connect()`, so a standalone
+Arming is a hard precondition, not best effort: if the obligation cannot be written the registry
+reaps the child it just spawned and the tool call fails. The `APIServerAdapter` owns the replay
+loop (started from `connect()`, cancelled on bind failure and on `disconnect()`, so a standalone
 `wizard-api.service` works without a GatewayRunner): it claims only its own receipts, reconciles
 armed receipts whose worker is gone into pending unknown outcomes, formats with
-`format_process_notification()` and self-posts through `gateway.wake` with a per-completion
-`Idempotency-Key`, settling only after accepted delivery. The outbox claim is the SINGLE arbiter —
-a durable-route completion is deliberately not queued on `completion_queue` and registers no
-gateway watcher. `wait`/`log`/explicit kill settle it `consumed` so no replay repeats a result the
-turn already read. Schema-1 receipts never replay. Route resolution prefers `origin_session_id`,
-then the API `chat_id`, and only then `session_key` — on `/v1/runs` the session key is the per-run
-approval id and resumes no conversation.
+`format_process_notification()` and self-posts through `gateway.wake`, settling only after an
+accepted delivery AND a successful settle. The outbox claim is the SINGLE arbiter — a
+durable-route completion is deliberately not queued on `completion_queue` and registers no gateway
+watcher. `wait`/`log`/explicit kill settle it `consumed`, and never by stealing a live claim: on a
+claimed receipt the intent is recorded and the claim holder converges it, so no completion can
+produce a second turn. Schema-1 receipts never replay. Route resolution prefers
+`origin_session_id`, then the API `chat_id`, and only then `session_key` — on `/v1/runs` the
+session key is the per-run approval id and resumes no conversation.
+
+Receipts are profile-LOCAL (they live in the spawning profile's `HERMES_HOME`) and carry the
+spawning profile as immutable identity, so under `multiplex_profiles` one replay pass enumerates
+every served profile's outbox and wakes each on its own `/p/<profile>/v1/chat/completions` mirror
+with that profile's own `API_SERVER_KEY`. A profile whose key is unresolvable is held, never
+delivered under another principal's credential.
+
+Exactly-once survives a restart. The per-completion `Idempotency-Key` is checked against a DURABLE
+ledger (`reserve_wake_delivery`) kept in the receipt the key names, not only against the API
+server's in-memory `_IdempotencyCache` — so a wake accepted by a process that died before settling
+its claim is replayed by the next process instead of re-running the user's turn. A claim is
+exclusive but expires, so a crashed consumer's receipt becomes replay-eligible again after
+`CLAIM_TTL_SECONDS` and converges to an observable `dropped` once the attempt budget is spent.
+Unresolved receipts (armed/pending/claimed) are never pruned by age or by the retained-result
+count cap; only a terminal one is collectable, and its `.lock` sidecar is unlinked solely from
+inside that lock.
 
 Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
 reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,

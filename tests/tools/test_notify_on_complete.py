@@ -526,10 +526,15 @@ class TestFiniteApiCompletionContract:
         assert fields["watcher_chat_id"] == "wizard-session-9"
         assert "run_abc123" not in fields.values()
 
-    def test_api_wake_drops_watch_patterns_but_keeps_the_process(
+    def test_api_watch_only_request_is_refused_rather_than_silently_stripped(
             self, monkeypatch, tmp_path, _pristine_session_context):
-        """Watch-pattern streaming needs a turn per match; the durable route grants one, for
-        the terminal outcome. The process still runs."""
+        """Changed deliberately: this used to strip the patterns and spawn anyway.
+
+        A watch-only request asks for one thing — tell me when this line appears — and the
+        durable route grants exactly one authorized turn, for the terminal outcome. Stripping the
+        patterns started a real job that would never report the match, on a finite run with no
+        later turn in which to notice. Fail closed BEFORE the spawn instead.
+        """
         spawns = []
         tt = _silent_bg_harness(monkeypatch, tmp_path, spawns)
         _bind_api_run(_pristine_session_context, completion_delivery="api_session_wake")
@@ -540,9 +545,31 @@ class TestFiniteApiCompletionContract:
             tt._active_environments.pop("default", None)
             tt._last_activity.pop("default", None)
 
+        assert spawns == [], "no process may exist for a contract that cannot be honored"
+        assert result["exit_code"] == -1
+        assert "session_id" not in result and "pid" not in result
+        assert "watch_patterns are not available" in result["error"]
+        assert "notify_on_complete=true" in result["error"], "must name the supported alternative"
+
+    def test_api_watch_plus_notify_keeps_the_pre_existing_conflict_downgrade(
+            self, monkeypatch, tmp_path, _pristine_session_context):
+        """notify_on_complete + watch_patterns is a flag CONFLICT, resolved the same way on every
+        surface (drop the patterns, keep the completion) — that predates the durable route."""
+        spawns = []
+        tt = _silent_bg_harness(monkeypatch, tmp_path, spawns)
+        _bind_api_run(_pristine_session_context, completion_delivery="api_session_wake")
+        try:
+            result = json.loads(tt.terminal_tool(
+                command="pytest tests/", background=True, notify_on_complete=True,
+                watch_patterns=["FAILED"]))
+        finally:
+            tt._active_environments.pop("default", None)
+            tt._last_activity.pop("default", None)
+
         assert result["session_id"] == "proc_silent_test"
+        assert result["notify_on_complete"] is True
         assert "watch_patterns" not in result
-        assert "watch_patterns_unsupported" in result
+        assert "notify_on_complete=True" in result["watch_patterns_ignored"]
 
     def test_non_api_finite_surface_keeps_the_degrade_note(
             self, monkeypatch, tmp_path, _pristine_session_context):

@@ -487,11 +487,16 @@ def _normalize_image_part(part: Dict[str, Any]) -> Dict[str, Any]:
     url_value = url_value.strip()
     lowered = url_value.lower()
     if lowered.startswith("data:"):
-        if not lowered.startswith("data:image/") or "," not in url_value:
+        if not lowered.startswith("data:image/"):
             raise ValueError(
                 "unsupported_content_type:Only image data URLs are supported. "
                 "Non-image data payloads are not supported.")
-    elif not (lowered.startswith("http://") or lowered.startswith("https://")):
+        from gateway.platforms.api_server_input_media import validate_inline_image_data_url
+        validate_inline_image_data_url(url_value)
+    elif lowered.startswith(("http://", "https://")):
+        from gateway.platforms.api_server_input_media import validate_remote_image_url
+        validate_remote_image_url(url_value)
+    else:
         raise ValueError(
             "invalid_image_url:Image inputs must use http(s) URLs or data:image/... URLs.")
     image_part: Dict[str, Any] = {"type": "image_url", "image_url": {"url": url_value}}
@@ -2208,6 +2213,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
+            "requested_provider": requested_provider or request_provider or "",
             "route_source": route_source}
         return agent
 
@@ -3762,12 +3768,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     self._shutdown_interruptible_agents[id(agent)] = agent
                     # Passed only when set: a human turn keeps today's call shape.
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
+                    from gateway.platforms.api_server_input_media import route_api_user_message
+                    routed_user_message, persist_user_message = route_api_user_message(agent, user_message)
                     conversation_kwargs = dict(
-                        user_message=user_message,
+                        user_message=routed_user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                         **author_kwargs,
                     )
+                    if persist_user_message:
+                        conversation_kwargs["persist_user_message"] = persist_user_message
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata
                     result = agent.run_conversation(**conversation_kwargs)

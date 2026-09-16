@@ -570,9 +570,13 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
+            from gateway.platforms.api_server_input_media import route_api_user_message
+            routed_user_message, persist_user_message = route_api_user_message(agent, run.user_message)
             r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id, **author_kwargs)
+                user_message=routed_user_message, conversation_history=run.conversation_history,
+                task_id=effective_task_id,
+                **({"persist_user_message": persist_user_message} if persist_user_message else {}),
+                **author_kwargs)
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)

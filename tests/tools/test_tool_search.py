@@ -61,6 +61,13 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_eager_tools_are_normalized_and_invalid_names_dropped(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({
+            "eager_tools": ["conversation_evidence_search", "", "bad tool name", 7],
+        })
+        assert cfg.eager_tools == frozenset({"conversation_evidence_search"})
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -200,6 +207,65 @@ class TestClassification:
         names = {td["function"]["name"] for td in assembled.tool_defs}
         assert "clarify" in names
         assert "computer_use" not in names
+
+    def test_operator_pinned_plugin_tool_stays_direct(self):
+        from tools.registry import registry
+        from tools.tool_search import BRIDGE_TOOL_NAMES, ToolSearchConfig, assemble_tool_defs
+
+        eager_name = "conversation_evidence_search_test"
+        deferred_name = "other_plugin_tool_test"
+        registry.register(
+            name=eager_name,
+            handler=lambda args, **kw: "{}",
+            schema=_td(eager_name, "Primary conversation evidence retrieval")["function"],
+            toolset="conversation_evidence_test",
+        )
+        registry.register(
+            name=deferred_name,
+            handler=lambda args, **kw: "{}",
+            schema=_td(deferred_name, "Another plugin capability")["function"],
+            toolset="other_plugin_test",
+        )
+        try:
+            assembled = assemble_tool_defs(
+                [_td(eager_name), _td(deferred_name)],
+                context_length=200_000,
+                config=ToolSearchConfig.from_raw({
+                    "enabled": "on",
+                    "eager_tools": [eager_name],
+                }),
+            )
+            names = {td["function"]["name"] for td in assembled.tool_defs}
+            assert assembled.activated
+            assert eager_name in names
+            assert deferred_name not in names
+            assert BRIDGE_TOOL_NAMES <= names
+        finally:
+            registry.deregister(eager_name)
+            registry.deregister(deferred_name)
+
+    def test_operator_pinned_plugin_tool_cannot_reenter_through_bridge(self, monkeypatch):
+        from tools import tool_search
+        from tools.registry import registry
+
+        eager_name = "conversation_evidence_bridge_reentry_test"
+        registry.register(
+            name=eager_name,
+            handler=lambda args, **kw: "{}",
+            schema=_td(eager_name, "Primary conversation evidence retrieval")["function"],
+            toolset="conversation_evidence_test",
+        )
+        config = tool_search.ToolSearchConfig.from_raw({"eager_tools": [eager_name]})
+        monkeypatch.setattr(tool_search, "load_config_readonly", lambda: config)
+        try:
+            name, args, err = tool_search.resolve_underlying_call({
+                "calls": [{"name": eager_name, "arguments": {}}],
+            })
+            assert name is None
+            assert args == {}
+            assert "not a deferrable tool" in err
+        finally:
+            registry.deregister(eager_name)
 
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must

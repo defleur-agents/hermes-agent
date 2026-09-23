@@ -1984,6 +1984,9 @@ DEFAULT_CONFIG = {
                 "show_tip", "desktop_project", "close_terminal",
                 "apply_layout", "read_terminal", "read_window_below", "focus_pane",
             ],
+            # Exact plugin/MCP tool names that remain directly callable while
+            # the rest of the external catalog stays progressively disclosed.
+            "eager_tools": [],
         },
         # Remote connector discovery/lifecycle through the Nous tool gateway.
         # The flag is the user's off switch; availability additionally requires

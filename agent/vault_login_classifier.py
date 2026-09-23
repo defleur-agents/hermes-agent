@@ -281,7 +281,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
 })()"""
 
 
-def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "") -> str:
+def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str = "", *, settle: bool = False) -> str:
     """Build a JS expression that fills the selected controls and reports only a count. The
     returned expression never echoes the values back.
 
@@ -296,7 +296,13 @@ def build_fill_js(fills: List[Dict[str, Any]], expected_origin: str, nonce: str 
     payload = json.dumps(
         [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
     )
-    return (_FILL_JS_TEMPLATE.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
+    template = _FILL_JS_TEMPLATE
+    if settle:
+        # React-controlled digit boxes commit between events, not within one JS batch.
+        template = template.replace("(() => {", "(async () => {", 1).replace(
+            "if (el.value.length > 0) filled += 1;",
+            "if (el.value.length > 0) filled += 1; await new Promise(resolve => setTimeout(resolve, 25));")
+    return (template.replace("__EXPECTED_ORIGIN__", json.dumps(expected_origin))
             .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce)))
 
 
@@ -310,6 +316,7 @@ _FILL_JS_TEMPLATE = """(() => {
   let filled = 0;
   const norm = (t) => String(t || "").trim().toLowerCase();
   for (const f of fills) {
+    if (window.location.origin !== expectedOrigin) return JSON.stringify({ refused: "origin_changed" });
     const el = document.querySelector('[data-hermes-vault-slot="' + nonce + ':' + f.index + '"]');
     if (!el || (f.token === "current-password" && el.type !== "password")) continue;
     try {

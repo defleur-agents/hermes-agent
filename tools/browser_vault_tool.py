@@ -352,6 +352,10 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     code: Optional[str] = None
     source = "user"
     backend = backend_for_handle(handle) if handle else None
+    meta = backend.get_meta(handle) if backend else None
+    if handle and (meta is None or meta.kind != "login" or meta.origin != origin):
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": "The saved login does not match the verification page."})
     if backend is not None:
         try:
             code = backend.resolve_otp(handle)
@@ -359,6 +363,14 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
             code = None
         if code:
             source = backend.name
+    if not code and meta is not None:
+        from tools.browser_vault_otp_source import OTPSourceError, resolve_configured_otp
+        try:
+            code = resolve_configured_otp(meta, origin)
+        except OTPSourceError as exc:
+            return json.dumps({"success": False, "error_type": "otp_source_failed", "error": str(exc)})
+        if code:
+            source = "configured_command"
     if not code:
         prompt = get_code_prompt_callback()
         if prompt is None or not can_prompt_here():
@@ -372,7 +384,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
 
     register_vault_redaction_value(code)
     fills = build_otp_fills(otp_controls, code)
-    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce))
+    result = _eval_js_secret(effective_task_id, build_fill_js(fills, expected_origin=origin, nonce=nonce, settle=True))
     del code
     if not result.get("success"):
         return json.dumps({"success": False, "error": str(result.get("error") or "fill failed")[:200]})

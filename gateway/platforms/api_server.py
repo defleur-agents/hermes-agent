@@ -3057,8 +3057,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
         limit = 500 if default_page else min(requested_limit, 500)
+        include_compacted_raw = request.query.get("include_compacted", "false").lower()
+        if include_compacted_raw not in {"true", "false"}:
+            return _error_response("include_compacted must be true or false", 400, code="invalid_pagination")
+        include_compacted = include_compacted_raw == "true"
         messages = await asyncio.to_thread(
-            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page)
+            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
+            include_compacted=include_compacted)
         return web.json_response({
             "object": "list", "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],

@@ -168,6 +168,9 @@ def test_a_secondary_whose_retirement_times_out_keeps_its_lock_but_is_never_star
         except sqlite3.OperationalError as exc:
             pytest.fail(f"the retained store's read error stopped API adapter publication: {exc}")
         assert host.adapters[Platform.API_SERVER] is api_adapter
+        from gateway.session_api_turn import STARTUP_MEDIA_SWEEPS
+        for sweep in STARTUP_MEDIA_SWEEPS:
+            sweep.join(5)
         assert api_read == [a.db for a in all_authorities(runner) if a is not beta]
 
         # Auto-resume fails closed on the retained store: the entry is held back, never resumed.

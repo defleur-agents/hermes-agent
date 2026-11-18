@@ -288,11 +288,31 @@ def recover_api_turns(adapter):
             recover_authority_api_turns(adapter, authority)
 
 
+STARTUP_MEDIA_SWEEPS = []
+
+
+def _sweep_unheld_api_images(collect, db):
+    import logging
+    try:
+        collect(db)
+    except Exception:
+        logging.getLogger(__name__).exception('Startup API image sweep failed; files stay for the next sweep')
+
+
 def recover_authority_api_turns(adapter, authority):
     from hermes_state_runtime import list_session_admissions
     from gateway.session_ingress_media import collect_unheld_api_images
+    import contextvars
     import logging
-    collect_unheld_api_images(authority.db)
+    import threading
+    # Off the loop, as the post-delete sweep already runs: its retained-history check scans every
+    # transcript row, minutes on a large state.db, and on the loop the liveness watchdog killed
+    # each startup before it finished (2026-11-08 restart loop). It only frees unowned bytes, so
+    # nothing below waits on it.
+    sweep = threading.Thread(target=contextvars.copy_context().run, args=(_sweep_unheld_api_images, collect_unheld_api_images, authority.db),
+                             daemon=True, name='api-image-startup-sweep')
+    STARTUP_MEDIA_SWEEPS.append(sweep)
+    sweep.start()
     from gateway.session_api_media import compact_settled_api_payloads
     compact_settled_api_payloads(authority.db)
     with authority.db._read_ctx() as conn:

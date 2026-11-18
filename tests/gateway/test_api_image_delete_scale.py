@@ -105,6 +105,9 @@ def test_startup_recovery_survives_a_thousand_api_images(api, owner, monkeypatch
     monkeypatch.setattr(owner, '_schedule', lambda ref: scheduled.append(ref.session_id))
     recover_api_turns(api)
     assert scheduled == ['queued']
+    from gateway.session_api_turn import STARTUP_MEDIA_SWEEPS
+    for sweep in STARTUP_MEDIA_SWEEPS:
+        sweep.join(5)
     assert _remaining(planted) == [kept_digest]
 
 

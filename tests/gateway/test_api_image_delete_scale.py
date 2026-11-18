@@ -120,4 +120,7 @@ def test_startup_recovery_continues_when_image_collection_fails(api, owner, monk
     monkeypatch.setattr(owner, '_schedule', lambda ref: scheduled.append(ref.session_id))
     recover_api_turns(api)
     assert scheduled == ['queued']
+    from gateway.session_api_turn import STARTUP_MEDIA_SWEEPS
+    for sweep in STARTUP_MEDIA_SWEEPS:
+        sweep.join(5)
     assert 'API image collection failed' in caplog.text

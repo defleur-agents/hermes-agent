@@ -80,6 +80,9 @@ async def test_restart_recovery_keeps_every_profiles_held_images_and_collects_ea
         assert beta_orphan.is_relative_to(beta) and launch_held.is_relative_to(launch / 'cache')
 
         recover_api_turns(adapter)  # the gateway's unscoped startup pass over every served profile
+        from gateway.session_api_turn import STARTUP_MEDIA_SWEEPS
+        for sweep in STARTUP_MEDIA_SWEEPS:
+            sweep.join(5)
 
         assert launch_held.read_bytes() == PNG + b'launch', 'a secondary profile collected the launch image'
         assert not launch_orphan.exists()
@@ -87,6 +90,8 @@ async def test_restart_recovery_keeps_every_profiles_held_images_and_collects_ea
         with _profile_runtime_scope(beta, hydrate_secrets=False):
             beta_held = completed_image_turn(authorities['beta'], PNG + b'beta')
         recover_api_turns(adapter)
+        for sweep in STARTUP_MEDIA_SWEEPS:
+            sweep.join(5)
         assert beta_held.read_bytes() == PNG + b'beta'
         assert launch_held.read_bytes() == PNG + b'launch'
     finally:
